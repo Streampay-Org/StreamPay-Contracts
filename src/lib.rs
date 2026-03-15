@@ -1,0 +1,183 @@
+//! StreamPay — Soroban smart contracts for continuous payment streaming.
+//!
+//! Provides: create_stream, start_stream, stop_stream, settle_stream.
+
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct StreamInfo {
+    pub payer: Address,
+    pub recipient: Address,
+    pub rate_per_second: i128,
+    pub balance: i128,
+    pub start_time: u64,
+    pub end_time: u64,
+    pub is_active: bool,
+}
+
+#[contract]
+pub struct StreamPayContract;
+
+#[contractimpl]
+impl StreamPayContract {
+    /// Create a new payment stream (payer, recipient, rate per second).
+    pub fn create_stream(
+        env: Env,
+        payer: Address,
+        recipient: Address,
+        rate_per_second: i128,
+        initial_balance: i128,
+    ) -> u32 {
+        payer.require_auth();
+        if rate_per_second <= 0 || initial_balance <= 0 {
+            panic!("rate and balance must be positive");
+        }
+        let stream_id = get_next_stream_id(&env);
+        let info = StreamInfo {
+            payer: payer.clone(),
+            recipient,
+            rate_per_second,
+            balance: initial_balance,
+            start_time: 0,
+            end_time: 0,
+            is_active: false,
+        };
+        set_stream(&env, stream_id, &info);
+        set_next_stream_id(&env, stream_id + 1);
+        stream_id
+    }
+
+    /// Start an existing stream.
+    pub fn start_stream(env: Env, stream_id: u32) {
+        let mut info = get_stream(&env, stream_id);
+        info.payer.require_auth();
+        if info.is_active {
+            panic!("stream already active");
+        }
+        info.is_active = true;
+        info.start_time = env.ledger().timestamp();
+        set_stream(&env, stream_id, &info);
+    }
+
+    /// Stop an active stream.
+    pub fn stop_stream(env: Env, stream_id: u32) {
+        let mut info = get_stream(&env, stream_id);
+        info.payer.require_auth();
+        if !info.is_active {
+            panic!("stream not active");
+        }
+        info.is_active = false;
+        info.end_time = env.ledger().timestamp();
+        set_stream(&env, stream_id, &info);
+    }
+
+    /// Settle stream: compute streamed amount since start and deduct from balance.
+    pub fn settle_stream(env: Env, stream_id: u32) -> i128 {
+        let mut info = get_stream(&env, stream_id);
+        if !info.is_active {
+            return 0;
+        }
+        let now = env.ledger().timestamp();
+        let elapsed = now - info.start_time;
+        let amount = (elapsed as i128)
+            .saturating_mul(info.rate_per_second)
+            .min(info.balance);
+        info.balance = info.balance.saturating_sub(amount);
+        info.start_time = now;
+        set_stream(&env, stream_id, &info);
+        amount
+    }
+
+    /// Get stream info (read-only).
+    pub fn get_stream_info(env: Env, stream_id: u32) -> StreamInfo {
+        get_stream(&env, stream_id)
+    }
+}
+
+fn stream_key(env: &Env, stream_id: u32) -> (Symbol, u32) {
+    (Symbol::new(env, "stream"), stream_id)
+}
+
+fn get_stream(env: &Env, stream_id: u32) -> StreamInfo {
+    let key = stream_key(env, stream_id);
+    env.storage()
+        .instance()
+        .get(&key)
+        .unwrap_or_else(|| panic!("stream not found"))
+}
+
+fn set_stream(env: &Env, stream_id: u32, info: &StreamInfo) {
+    let key = stream_key(env, stream_id);
+    env.storage().instance().set(&key, info);
+}
+
+fn get_next_stream_id(env: &Env) -> u32 {
+    let key = Symbol::new(env, "next_id");
+    env.storage().instance().get(&key).unwrap_or(1)
+}
+
+fn set_next_stream_id(env: &Env, id: u32) {
+    let key = Symbol::new(env, "next_id");
+    env.storage().instance().set(&key, &id);
+}
+
+#[cfg(test)]
+mod test {
+    use soroban_sdk::testutils::Address as _;
+
+    use super::*;
+
+    #[test]
+    fn test_create_stream_valid() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+        assert_eq!(stream_id, 1);
+
+        let info = client.get_stream_info(&stream_id);
+        assert_eq!(info.payer, payer);
+        assert_eq!(info.recipient, recipient);
+        assert_eq!(info.rate_per_second, 100);
+        assert_eq!(info.balance, 10_000);
+        assert!(!info.is_active);
+    }
+
+    #[test]
+    fn test_start_and_stop_stream() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &50_i128, &5_000_i128);
+        client.start_stream(&stream_id);
+        let info = client.get_stream_info(&stream_id);
+        assert!(info.is_active);
+        client.stop_stream(&stream_id);
+        let info = client.get_stream_info(&stream_id);
+        assert!(!info.is_active);
+    }
+
+    #[test]
+    fn test_settle_returns_amount() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &10_i128, &1_000_i128);
+        client.start_stream(&stream_id);
+        let amount = client.settle_stream(&stream_id);
+        assert!(amount >= 0);
+    }
+}
