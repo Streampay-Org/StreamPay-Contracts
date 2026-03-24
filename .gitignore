@@ -3,4 +3,5 @@
 .env
 .idea
 *.iml
-docs/
+artifacts/
+docs/superpowers/
