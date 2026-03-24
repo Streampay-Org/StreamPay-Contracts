@@ -8,6 +8,15 @@ use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
 /// Current: 0.1.0 → 1_000
 const VERSION: u32 = 1_000;
 
+/// TTL threshold: extend when remaining TTL drops below ~1 day (17_280 ledgers at ~5s each).
+const STREAM_TTL_THRESHOLD: u32 = 17_280;
+/// TTL extend-to: refresh to ~30 days (518_400 ledgers).
+const STREAM_TTL_EXTEND: u32 = 518_400;
+/// Instance storage TTL threshold (~1 day).
+const INSTANCE_TTL_THRESHOLD: u32 = 17_280;
+/// Instance storage TTL extend-to (~30 days).
+const INSTANCE_TTL_EXTEND: u32 = 518_400;
+
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct StreamInfo {
