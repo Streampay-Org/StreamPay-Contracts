@@ -120,12 +120,16 @@ impl StreamPayContract {
         VERSION
     }
 
-    /// Archive (remove) a settled or inactive stream. Payer-only.
+    /// Archive (remove) a fully-settled, inactive stream. Payer-only.
+    /// Stream must be inactive and have zero balance to protect recipient entitlements.
     pub fn archive_stream(env: Env, stream_id: u32) {
         let info = get_stream(&env, stream_id);
         info.payer.require_auth();
         if info.is_active {
             panic!("cannot archive active stream");
+        }
+        if info.balance != 0 {
+            panic!("cannot archive stream with unsettled balance");
         }
         let key = stream_key(&env, stream_id);
         env.storage().persistent().remove(&key);
@@ -325,7 +329,8 @@ mod test {
     }
 
     #[test]
-    fn test_archive_inactive_stream() {
+    #[should_panic]
+    fn test_archive_unsettled_stream_panics() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(StreamPayContract, ());
@@ -335,10 +340,8 @@ mod test {
         let recipient = Address::generate(&env);
         let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
 
-        // Stream was never started (is_active = false) — archivable
-        // Note: balance > 0 but stream is inactive. Per spec, is_active = false
-        // is sufficient for archival. The payer created the stream and chooses
-        // to remove it before starting.
+        // Stream is inactive but has balance > 0 — should panic
+        // to protect recipient's entitlement
         client.archive_stream(&stream_id);
     }
 
@@ -369,7 +372,14 @@ mod test {
 
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+        // Create, start, drain, stop, then archive
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &1_000_i128);
+        client.start_stream(&stream_id);
+        env.ledger().with_mut(|li| {
+            li.timestamp += 10;
+        });
+        client.settle_stream(&stream_id);
+        client.stop_stream(&stream_id);
         client.archive_stream(&stream_id);
 
         // Should panic — stream was archived (removed from storage)
