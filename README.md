@@ -59,14 +59,29 @@ On every push/PR to `main`, GitHub Actions runs:
 
 Ensure all three pass before merging.
 
+## Releases
+
+Tagged releases follow [semver](https://semver.org/). Each release includes an optimized WASM artifact and SHA-256 checksum.
+
+See [docs/RELEASE.md](docs/RELEASE.md) for the full release process, including how to verify WASM builds.
+
 ## Project structure
 
 ```
 streampay-contracts/
 ├── src/
-│   └── lib.rs      # Contract and tests
+│   └── lib.rs                        # Contract and tests
+├── docker/
+│   └── Dockerfile.build              # Deterministic WASM builder
+├── .github/workflows/
+│   ├── ci.yml                        # Format, build, test
+│   └── release.yml                   # Tagged release workflow
+├── docs/
+│   └── RELEASE.md                    # Release process guide
+├── cliff.toml                        # Changelog generator config
+├── rust-toolchain.toml               # Pinned Rust version
 ├── Cargo.toml
-├── .github/workflows/ci.yml
+├── CHANGELOG.md
 └── README.md
 ```
 
