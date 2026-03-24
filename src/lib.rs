@@ -1,6 +1,7 @@
 //! StreamPay — Soroban smart contracts for continuous payment streaming.
 //!
-//! Provides: create_stream, start_stream, stop_stream, settle_stream, version.
+//! Provides: create_stream, start_stream, stop_stream, settle_stream,
+//! archive_stream, get_stream_info, version.
 
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
 
