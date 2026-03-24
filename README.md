@@ -13,6 +13,19 @@ This repo contains the on-chain logic for creating, starting, stopping, and sett
 - **`stop_stream(stream_id)`** — Stop an active stream.
 - **`settle_stream(stream_id)`** — Compute and deduct streamed amount since last settlement; returns amount.
 - **`get_stream_info(stream_id)`** — Read stream metadata (payer, recipient, rate, balance, timestamps, active).
+- **`version()`** — Returns the contract version as a `u32` (no auth required).
+
+### Version encoding
+
+The on-chain version uses a packed `u32` scheme: `major * 1_000_000 + minor * 1_000 + patch`.
+
+| Semver | u32       |
+|--------|-----------|
+| 0.1.0  | 1 000     |
+| 1.0.0  | 1 000 000 |
+| 1.2.3  | 1 002 003 |
+
+When releasing, update **both** `Cargo.toml` `version` and the `VERSION` const in `src/lib.rs`.
 
 ## Prerequisites
 
