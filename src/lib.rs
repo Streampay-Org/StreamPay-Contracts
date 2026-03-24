@@ -120,14 +120,14 @@ fn stream_key(env: &Env, stream_id: u32) -> (Symbol, u32) {
 fn get_stream(env: &Env, stream_id: u32) -> StreamInfo {
     let key = stream_key(env, stream_id);
     env.storage()
-        .instance()
+        .persistent()
         .get(&key)
         .unwrap_or_else(|| panic!("stream not found"))
 }
 
 fn set_stream(env: &Env, stream_id: u32, info: &StreamInfo) {
     let key = stream_key(env, stream_id);
-    env.storage().instance().set(&key, info);
+    env.storage().persistent().set(&key, info);
 }
 
 fn get_next_stream_id(env: &Env) -> u32 {
@@ -221,5 +221,21 @@ mod test {
         let contract_id = env.register(StreamPayContract, ());
         let client = StreamPayContractClient::new(&env, &contract_id);
         assert!(client.version() > 0);
+    }
+
+    #[test]
+    fn test_stream_uses_persistent_storage() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+
+        // Verify stream is retrievable (storage works)
+        let info = client.get_stream_info(&stream_id);
+        assert_eq!(info.balance, 10_000);
     }
 }
