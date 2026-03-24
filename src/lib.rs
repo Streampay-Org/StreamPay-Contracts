@@ -4,6 +4,10 @@
 
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
 
+/// Contract version: major * 1_000_000 + minor * 1_000 + patch.
+/// Current: 0.1.0 → 1_000
+const VERSION: u32 = 1_000;
+
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct StreamInfo {
@@ -93,6 +97,11 @@ impl StreamPayContract {
     pub fn get_stream_info(env: Env, stream_id: u32) -> StreamInfo {
         get_stream(&env, stream_id)
     }
+
+    /// Returns the contract version as a u32 (see VERSION encoding).
+    pub fn version(_env: Env) -> u32 {
+        VERSION
+    }
 }
 
 fn stream_key(env: &Env, stream_id: u32) -> (Symbol, u32) {
@@ -179,5 +188,29 @@ mod test {
         client.start_stream(&stream_id);
         let amount = client.settle_stream(&stream_id);
         assert!(amount >= 0);
+    }
+
+    #[test]
+    fn test_version_returns_expected() {
+        let env = Env::default();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+        assert_eq!(client.version(), 1_000);
+    }
+
+    #[test]
+    fn test_version_matches_const() {
+        let env = Env::default();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+        assert_eq!(client.version(), VERSION);
+    }
+
+    #[test]
+    fn test_version_is_positive() {
+        let env = Env::default();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+        assert!(client.version() > 0);
     }
 }
