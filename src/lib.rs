@@ -58,6 +58,8 @@ impl StreamPayContract {
         };
         set_stream(&env, stream_id, &info);
         set_next_stream_id(&env, stream_id + 1);
+        extend_stream_ttl(&env, stream_id);
+        extend_instance_ttl(&env);
         stream_id
     }
 
@@ -71,6 +73,8 @@ impl StreamPayContract {
         info.is_active = true;
         info.start_time = env.ledger().timestamp();
         set_stream(&env, stream_id, &info);
+        extend_stream_ttl(&env, stream_id);
+        extend_instance_ttl(&env);
     }
 
     /// Stop an active stream.
@@ -83,6 +87,8 @@ impl StreamPayContract {
         info.is_active = false;
         info.end_time = env.ledger().timestamp();
         set_stream(&env, stream_id, &info);
+        extend_stream_ttl(&env, stream_id);
+        extend_instance_ttl(&env);
     }
 
     /// Settle stream: compute streamed amount since start and deduct from balance.
@@ -99,6 +105,8 @@ impl StreamPayContract {
         info.balance = info.balance.saturating_sub(amount);
         info.start_time = now;
         set_stream(&env, stream_id, &info);
+        extend_stream_ttl(&env, stream_id);
+        extend_instance_ttl(&env);
         amount
     }
 
@@ -140,9 +148,23 @@ fn set_next_stream_id(env: &Env, id: u32) {
     env.storage().instance().set(&key, &id);
 }
 
+fn extend_stream_ttl(env: &Env, stream_id: u32) {
+    let key = stream_key(env, stream_id);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, STREAM_TTL_THRESHOLD, STREAM_TTL_EXTEND);
+}
+
+fn extend_instance_ttl(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND);
+}
+
 #[cfg(test)]
 mod test {
     use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::Ledger as _;
 
     use super::*;
 
@@ -235,6 +257,28 @@ mod test {
         let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
 
         // Verify stream is retrievable (storage works)
+        let info = client.get_stream_info(&stream_id);
+        assert_eq!(info.balance, 10_000);
+    }
+
+    #[test]
+    fn test_create_stream_extends_ttl() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+
+        // Advance ledger by a modest amount — stream should still be alive
+        // because create_stream extended its TTL
+        env.ledger().with_mut(|li| {
+            li.sequence_number += 1_000;
+            li.timestamp += 5_000;
+        });
+
         let info = client.get_stream_info(&stream_id);
         assert_eq!(info.balance, 10_000);
     }
