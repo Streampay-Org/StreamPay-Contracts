@@ -119,6 +119,18 @@ impl StreamPayContract {
     pub fn version(_env: Env) -> u32 {
         VERSION
     }
+
+    /// Archive (remove) a settled or inactive stream. Payer-only.
+    pub fn archive_stream(env: Env, stream_id: u32) {
+        let info = get_stream(&env, stream_id);
+        info.payer.require_auth();
+        if info.is_active {
+            panic!("cannot archive active stream");
+        }
+        let key = stream_key(&env, stream_id);
+        env.storage().persistent().remove(&key);
+        extend_instance_ttl(&env);
+    }
 }
 
 fn stream_key(env: &Env, stream_id: u32) -> (Symbol, u32) {
@@ -281,5 +293,86 @@ mod test {
 
         let info = client.get_stream_info(&stream_id);
         assert_eq!(info.balance, 10_000);
+    }
+
+    #[test]
+    fn test_archive_settled_stream() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        // rate=100/s, balance=1000 → fully drained after 10s
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &1_000_i128);
+        client.start_stream(&stream_id);
+
+        // Advance 10 seconds so balance drains to 0
+        env.ledger().with_mut(|li| {
+            li.timestamp += 10;
+        });
+        let amount = client.settle_stream(&stream_id);
+        assert_eq!(amount, 1_000);
+
+        client.stop_stream(&stream_id);
+        let info = client.get_stream_info(&stream_id);
+        assert_eq!(info.balance, 0);
+        assert!(!info.is_active);
+
+        // Now archive — stream is stopped and fully settled
+        client.archive_stream(&stream_id);
+    }
+
+    #[test]
+    fn test_archive_inactive_stream() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+
+        // Stream was never started (is_active = false) — archivable
+        // Note: balance > 0 but stream is inactive. Per spec, is_active = false
+        // is sufficient for archival. The payer created the stream and chooses
+        // to remove it before starting.
+        client.archive_stream(&stream_id);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_archive_active_stream_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+        client.start_stream(&stream_id);
+
+        // Should panic — stream is active
+        client.archive_stream(&stream_id);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_archived_stream_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+        client.archive_stream(&stream_id);
+
+        // Should panic — stream was archived (removed from storage)
+        client.get_stream_info(&stream_id);
     }
 }
