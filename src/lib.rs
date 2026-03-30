@@ -2,12 +2,20 @@
 //!
 //! Provides: create_stream, start_stream, stop_stream, settle_stream,
 //! archive_stream, get_stream_info, version.
+//!
+//! ## Memo Field
+//! Each stream may carry an immutable `memo: String` (max 32 bytes) set at creation.
+//! The memo is intended for off-chain dapp correlation (e.g., external_id, reference string).
+//! It is **read-only** after creation — no edit function is provided.
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol};
 
 /// Contract version: major * 1_000_000 + minor * 1_000 + patch.
 /// Current: 0.1.0 → 1_000
 const VERSION: u32 = 1_000;
+
+/// Maximum byte length for the stream `memo` field.
+const MEMO_MAX_LEN: u32 = 32;
 
 /// TTL threshold: extend when remaining TTL drops below ~1 day (17_280 ledgers at ~5s each).
 const STREAM_TTL_THRESHOLD: u32 = 17_280;
@@ -28,6 +36,7 @@ pub struct StreamInfo {
     pub start_time: u64,
     pub end_time: u64,
     pub is_active: bool,
+    pub memo: String,
 }
 
 #[contract]
@@ -42,7 +51,11 @@ impl StreamPayContract {
         recipient: Address,
         rate_per_second: i128,
         initial_balance: i128,
+        memo: String,
     ) -> u32 {
+        if memo.len() > MEMO_MAX_LEN as u32 {
+            panic!("memo exceeds 32 chars");
+        }
         payer.require_auth();
         if rate_per_second <= 0 || initial_balance <= 0 {
             panic!("rate and balance must be positive");
@@ -56,6 +69,7 @@ impl StreamPayContract {
             start_time: 0,
             end_time: 0,
             is_active: false,
+            memo,
         };
         set_stream(&env, stream_id, &info);
         set_next_stream_id(&env, stream_id + 1);
@@ -194,7 +208,7 @@ mod test {
 
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128, &String::from_str(&env, "memo"));
         assert_eq!(stream_id, 1);
 
         let info = client.get_stream_info(&stream_id);
@@ -203,6 +217,7 @@ mod test {
         assert_eq!(info.rate_per_second, 100);
         assert_eq!(info.balance, 10_000);
         assert!(!info.is_active);
+        assert_eq!(info.memo, String::from_str(&env, "memo"));
     }
 
     #[test]
@@ -214,13 +229,14 @@ mod test {
 
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &50_i128, &5_000_i128);
+        let stream_id = client.create_stream(&payer, &recipient, &50_i128, &5_000_i128, &String::from_str(&env, "memo"));
         client.start_stream(&stream_id);
         let info = client.get_stream_info(&stream_id);
         assert!(info.is_active);
         client.stop_stream(&stream_id);
         let info = client.get_stream_info(&stream_id);
         assert!(!info.is_active);
+        assert_eq!(info.memo, String::from_str(&env, "memo"));
     }
 
     #[test]
@@ -232,7 +248,7 @@ mod test {
 
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &10_i128, &1_000_i128);
+        let stream_id = client.create_stream(&payer, &recipient, &10_i128, &1_000_i128, &String::from_str(&env, "memo"));
         client.start_stream(&stream_id);
         let amount = client.settle_stream(&stream_id);
         assert!(amount >= 0);
@@ -271,7 +287,7 @@ mod test {
 
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128, &String::from_str(&env, "memo"));
 
         // Verify stream is retrievable (storage works)
         let info = client.get_stream_info(&stream_id);
@@ -287,7 +303,7 @@ mod test {
 
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128, &String::from_str(&env, "memo"));
 
         // Advance ledger by a modest amount — stream should still be alive
         // because create_stream extended its TTL
@@ -310,7 +326,7 @@ mod test {
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
         // rate=100/s, balance=1000 → fully drained after 10s
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &1_000_i128);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &1_000_i128, &String::from_str(&env, "memo"));
         client.start_stream(&stream_id);
 
         // Advance 10 seconds so balance drains to 0
@@ -324,6 +340,7 @@ mod test {
         let info = client.get_stream_info(&stream_id);
         assert_eq!(info.balance, 0);
         assert!(!info.is_active);
+        assert_eq!(info.memo, String::from_str(&env, "memo"));
 
         // Now archive — stream is stopped and fully settled
         client.archive_stream(&stream_id);
@@ -339,7 +356,7 @@ mod test {
 
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128, &String::from_str(&env, "memo"));
 
         // Stream is inactive but has balance > 0 — should panic
         // to protect recipient's entitlement
@@ -356,7 +373,7 @@ mod test {
 
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128, &String::from_str(&env, "memo"));
         client.start_stream(&stream_id);
 
         // Should panic — stream is active
@@ -374,7 +391,7 @@ mod test {
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
         // Create, start, drain, stop, then archive
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &1_000_i128);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &1_000_i128, &String::from_str(&env, "memo"));
         client.start_stream(&stream_id);
         env.ledger().with_mut(|li| {
             li.timestamp += 10;
@@ -385,5 +402,34 @@ mod test {
 
         // Should panic — stream was archived (removed from storage)
         client.get_stream_info(&stream_id);
+    }
+
+    #[test]
+    #[should_panic(expected = "memo exceeds 32 chars")]
+    fn test_create_stream_memo_too_long() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let memo = String::from_str(&env, "this-memo-is-way-too-long-and-should-fail");
+        client.create_stream(&payer, &recipient, &100_i128, &10_000_i128, &memo);
+    }
+
+    #[test]
+    fn test_create_stream_empty_memo() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let memo = String::from_str(&env, "");
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128, &memo);
+        let info = client.get_stream_info(&stream_id);
+        assert_eq!(info.memo, memo);
     }
 }
