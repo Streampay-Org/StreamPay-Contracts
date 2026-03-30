@@ -5,6 +5,9 @@
 
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
 
+#[cfg(any(test, feature = "testutils"))]
+pub mod test_utils;
+
 /// Contract version: major * 1_000_000 + minor * 1_000 + patch.
 /// Current: 0.1.0 → 1_000
 const VERSION: u32 = 1_000;
@@ -385,5 +388,25 @@ mod test {
 
         // Should panic — stream was archived (removed from storage)
         client.get_stream_info(&stream_id);
+    }
+
+    #[test]
+    #[should_panic(expected = "MockToken: transfer failed (intentional simulation)")]
+    fn test_mock_token_transfer_failure() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        // Register MockToken
+        let token_id = env.register(test_utils::MockToken, ());
+        let token_client = test_utils::MockTokenClient::new(&env, &token_id);
+
+        token_client.init();
+        token_client.set_fail(&true);
+
+        let from = Address::generate(&env);
+        let to = Address::generate(&env);
+
+        // This should panic
+        token_client.transfer(&from, &to, &100);
     }
 }
