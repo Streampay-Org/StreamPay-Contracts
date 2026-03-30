@@ -9,6 +9,13 @@ This repo contains the on-chain logic for creating, starting, stopping, and sett
 ### Contract interface
 
 - **`create_stream(payer, recipient, rate_per_second, initial_balance)`** — Create a new stream (payer must auth).
+
+Notes on anti-dust minima
+
+- The contract defines conservative built-in minima for `rate_per_second` and `initial_balance` to avoid uneconomical streams and rounding dust. These are implemented as `MIN_RATE_PER_SECOND` and `MIN_INITIAL_BALANCE` in `src/lib.rs` and are enforced at stream creation. Adjust these constants in the source before deployment if a different minimum is required per deployment.
+
+ - Attempting to create a stream with values below these minima will panic with a clear error message.
+
 - **`start_stream(stream_id)`** — Start an existing stream.
 - **`stop_stream(stream_id)`** — Stop an active stream.
 - **`settle_stream(stream_id)`** — Compute and deduct streamed amount since last settlement; returns amount.
