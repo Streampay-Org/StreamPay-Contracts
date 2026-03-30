@@ -3,32 +3,22 @@
 //! Provides: create_stream, start_stream, stop_stream, settle_stream,
 //! archive_stream, get_stream_info, version.
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
+mod stream;
+
+use soroban_sdk::{contract, contractimpl, Address, Env, Symbol};
+use crate::stream::{
+    StreamInfo, get_stream, set_stream, stream_key, extend_stream_ttl,
+    STREAM_TTL_THRESHOLD, STREAM_TTL_EXTEND
+};
 
 /// Contract version: major * 1_000_000 + minor * 1_000 + patch.
 /// Current: 0.1.0 → 1_000
 const VERSION: u32 = 1_000;
 
-/// TTL threshold: extend when remaining TTL drops below ~1 day (17_280 ledgers at ~5s each).
-const STREAM_TTL_THRESHOLD: u32 = 17_280;
-/// TTL extend-to: refresh to ~30 days (518_400 ledgers).
-const STREAM_TTL_EXTEND: u32 = 518_400;
 /// Instance storage TTL threshold (~1 day).
 const INSTANCE_TTL_THRESHOLD: u32 = 17_280;
 /// Instance storage TTL extend-to (~30 days).
 const INSTANCE_TTL_EXTEND: u32 = 518_400;
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct StreamInfo {
-    pub payer: Address,
-    pub recipient: Address,
-    pub rate_per_second: i128,
-    pub balance: i128,
-    pub start_time: u64,
-    pub end_time: u64,
-    pub is_active: bool,
-}
 
 #[contract]
 pub struct StreamPayContract;
@@ -138,23 +128,6 @@ impl StreamPayContract {
     }
 }
 
-fn stream_key(env: &Env, stream_id: u32) -> (Symbol, u32) {
-    (Symbol::new(env, "stream"), stream_id)
-}
-
-fn get_stream(env: &Env, stream_id: u32) -> StreamInfo {
-    let key = stream_key(env, stream_id);
-    env.storage()
-        .persistent()
-        .get(&key)
-        .unwrap_or_else(|| panic!("stream not found"))
-}
-
-fn set_stream(env: &Env, stream_id: u32, info: &StreamInfo) {
-    let key = stream_key(env, stream_id);
-    env.storage().persistent().set(&key, info);
-}
-
 fn get_next_stream_id(env: &Env) -> u32 {
     let key = Symbol::new(env, "next_id");
     env.storage().instance().get(&key).unwrap_or(1)
@@ -163,13 +136,6 @@ fn get_next_stream_id(env: &Env) -> u32 {
 fn set_next_stream_id(env: &Env, id: u32) {
     let key = Symbol::new(env, "next_id");
     env.storage().instance().set(&key, &id);
-}
-
-fn extend_stream_ttl(env: &Env, stream_id: u32) {
-    let key = stream_key(env, stream_id);
-    env.storage()
-        .persistent()
-        .extend_ttl(&key, STREAM_TTL_THRESHOLD, STREAM_TTL_EXTEND);
 }
 
 fn extend_instance_ttl(env: &Env) {
