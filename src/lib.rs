@@ -3,7 +3,7 @@
 //! Provides: create_stream, start_stream, stop_stream, settle_stream,
 //! archive_stream, get_stream_info, version.
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol};
 
 /// Contract version: major * 1_000_000 + minor * 1_000 + patch.
 /// Current: 0.1.0 → 1_000
@@ -30,11 +30,32 @@ pub struct StreamInfo {
     pub is_active: bool,
 }
 
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub token: Address,
+    pub max_rate: i128,
+}
+
+const CONFIG_KEY: Symbol = symbol_short!("CONFIG");
+
 #[contract]
 pub struct StreamPayContract;
 
 #[contractimpl]
 impl StreamPayContract {
+    /// Initialize the contract with global configuration (one-time only).
+    pub fn initialize(env: Env, token: Address, max_rate: i128) {
+        if env.storage().instance().has(&CONFIG_KEY) {
+            panic!("already initialized");
+        }
+        // Require auth from the account/contract that invoked this call.
+        env.invoker().require_auth();
+
+        let config = Config { token, max_rate };
+        env.storage().instance().set(&CONFIG_KEY, &config);
+        extend_instance_ttl(&env);
+    }
     /// Create a new payment stream (payer, recipient, rate per second).
     pub fn create_stream(
         env: Env,
@@ -121,6 +142,11 @@ impl StreamPayContract {
         VERSION
     }
 
+    /// Get the current global configuration.
+    pub fn get_config(env: Env) -> Config {
+        get_config(&env)
+    }
+
     /// Archive (remove) a fully-settled, inactive stream. Payer-only.
     /// Stream must be inactive and have zero balance to protect recipient entitlements.
     pub fn archive_stream(env: Env, stream_id: u32) {
@@ -163,6 +189,13 @@ fn get_next_stream_id(env: &Env) -> u32 {
 fn set_next_stream_id(env: &Env, id: u32) {
     let key = Symbol::new(env, "next_id");
     env.storage().instance().set(&key, &id);
+}
+
+fn get_config(env: &Env) -> Config {
+    env.storage()
+        .instance()
+        .get(&CONFIG_KEY)
+        .unwrap_or_else(|| panic!("contract not initialized"))
 }
 
 fn extend_stream_ttl(env: &Env, stream_id: u32) {
