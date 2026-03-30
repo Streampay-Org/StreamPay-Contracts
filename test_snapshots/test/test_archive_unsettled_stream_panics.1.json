@@ -144,6 +144,14 @@
                     },
                     {
                       "key": {
+                        "symbol": "schema_version"
+                      },
+                      "val": {
+                        "u32": 1
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "start_time"
                       },
                       "val": {

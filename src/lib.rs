@@ -9,6 +9,19 @@ use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
 /// Current: 0.1.0 → 1_000
 const VERSION: u32 = 1_000;
 
+/// Schema version stored inside every [`StreamInfo`] entry.
+///
+/// Increment this constant whenever a field is added to or removed from
+/// [`StreamInfo`].  The value is written at creation time and can be read
+/// back to detect entries that pre-date a schema change.
+///
+/// | Value | Fields present |
+/// |-------|----------------|
+/// | 1     | All fields in the initial `StreamInfo` definition (this release) |
+///
+/// See `docs/schema-versioning.md` for the full evolution policy.
+const STREAM_SCHEMA_VERSION: u32 = 1;
+
 /// TTL threshold: extend when remaining TTL drops below ~1 day (17_280 ledgers at ~5s each).
 const STREAM_TTL_THRESHOLD: u32 = 17_280;
 /// TTL extend-to: refresh to ~30 days (518_400 ledgers).
@@ -18,15 +31,56 @@ const INSTANCE_TTL_THRESHOLD: u32 = 17_280;
 /// Instance storage TTL extend-to (~30 days).
 const INSTANCE_TTL_EXTEND: u32 = 518_400;
 
+/// Metadata for a single payment stream stored in Soroban persistent storage.
+///
+/// # Schema versioning
+///
+/// Soroban serialises `#[contracttype]` structs as XDR maps keyed by field
+/// name (symbol).  Adding a **new** field to this struct is a **breaking
+/// change** for any entry that was written before the upgrade: the host will
+/// panic when it tries to deserialise the old map into the new struct because
+/// the new key is absent.
+///
+/// To handle this safely:
+///
+/// 1. **Never remove or rename existing fields.**  Removal causes the same
+///    deserialisation panic for new code reading old data; renaming is
+///    equivalent to a remove + add.
+/// 2. **Add new optional fields as sentinel-defaulted values.**  When a new
+///    field must be added, provide a migration path (e.g. a `migrate_stream`
+///    admin function) that reads old entries, supplies the sentinel default,
+///    and re-writes them before any contract logic depends on the new field.
+/// 3. **Use `schema_version` to detect stale entries.**  Every `StreamInfo`
+///    carries [`schema_version`](StreamInfo::schema_version) set to
+///    [`STREAM_SCHEMA_VERSION`] at creation.  Code that reads an entry can
+///    compare this value against the constant to decide whether migration is
+///    needed.
+/// 4. **Bump [`STREAM_SCHEMA_VERSION`] with every struct change.**  This
+///    makes stale entries detectable at runtime.
+///
+/// See `docs/schema-versioning.md` for the full policy, sentinel defaults
+/// table, and worked migration examples.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct StreamInfo {
+    /// Schema version of this entry; set to [`STREAM_SCHEMA_VERSION`] at
+    /// creation.  Used to detect entries written by an older contract version.
+    pub schema_version: u32,
+    /// Address that created and funds the stream.
     pub payer: Address,
+    /// Address that receives the streamed funds.
     pub recipient: Address,
+    /// Tokens released per second while the stream is active.
     pub rate_per_second: i128,
+    /// Remaining token balance available for streaming.
     pub balance: i128,
+    /// Ledger timestamp when the stream was last started (seconds since Unix epoch).
+    /// `0` when the stream has never been started.
     pub start_time: u64,
+    /// Ledger timestamp when the stream was stopped.
+    /// `0` while the stream is active or has never been stopped.
     pub end_time: u64,
+    /// `true` while the stream is running; `false` when created, stopped, or settled.
     pub is_active: bool,
 }
 
@@ -49,6 +103,7 @@ impl StreamPayContract {
         }
         let stream_id = get_next_stream_id(&env);
         let info = StreamInfo {
+            schema_version: STREAM_SCHEMA_VERSION,
             payer: payer.clone(),
             recipient,
             rate_per_second,
@@ -385,5 +440,72 @@ mod test {
 
         // Should panic — stream was archived (removed from storage)
         client.get_stream_info(&stream_id);
+    }
+
+    // ── schema versioning tests ───────────────────────────────────────────────
+
+    /// Newly created streams carry the current schema version sentinel.
+    #[test]
+    fn test_stream_schema_version_is_current() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &10_i128, &100_i128);
+
+        let info = client.get_stream_info(&stream_id);
+        assert_eq!(
+            info.schema_version, STREAM_SCHEMA_VERSION,
+            "schema_version must equal STREAM_SCHEMA_VERSION at creation"
+        );
+    }
+
+    /// schema_version is positive (guards against accidental zero-init).
+    #[test]
+    fn test_stream_schema_version_is_positive() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &10_i128, &100_i128);
+
+        let info = client.get_stream_info(&stream_id);
+        assert!(info.schema_version > 0, "schema_version must never be zero");
+    }
+
+    /// schema_version is preserved across stop/settle round-trips.
+    #[test]
+    fn test_stream_schema_version_survives_lifecycle() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &10_i128, &1_000_i128);
+
+        client.start_stream(&stream_id);
+        env.ledger().with_mut(|li| li.timestamp += 5);
+        client.settle_stream(&stream_id);
+        client.stop_stream(&stream_id);
+
+        let info = client.get_stream_info(&stream_id);
+        assert_eq!(
+            info.schema_version, STREAM_SCHEMA_VERSION,
+            "schema_version must not change during normal lifecycle operations"
+        );
+    }
+
+    /// STREAM_SCHEMA_VERSION constant itself is the expected value (regression guard).
+    #[test]
+    fn test_schema_version_const_value() {
+        assert_eq!(STREAM_SCHEMA_VERSION, 1, "initial schema version must be 1");
     }
 }
