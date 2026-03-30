@@ -28,6 +28,9 @@ pub struct StreamInfo {
     pub start_time: u64,
     pub end_time: u64,
     pub is_active: bool,
+    /// When `true`, the recipient is also authorised to call `stop_stream`.
+    /// Defaults to `false` (payer-only behaviour) when not explicitly set.
+    pub recipient_can_stop: bool,
 }
 
 #[contract]
@@ -36,12 +39,16 @@ pub struct StreamPayContract;
 #[contractimpl]
 impl StreamPayContract {
     /// Create a new payment stream (payer, recipient, rate per second).
+    ///
+    /// `recipient_can_stop` — when `true` the recipient is also permitted to
+    /// call [`stop_stream`].  Defaults to `false` (payer-only) when omitted.
     pub fn create_stream(
         env: Env,
         payer: Address,
         recipient: Address,
         rate_per_second: i128,
         initial_balance: i128,
+        recipient_can_stop: bool,
     ) -> u32 {
         payer.require_auth();
         if rate_per_second <= 0 || initial_balance <= 0 {
@@ -56,6 +63,7 @@ impl StreamPayContract {
             start_time: 0,
             end_time: 0,
             is_active: false,
+            recipient_can_stop,
         };
         set_stream(&env, stream_id, &info);
         set_next_stream_id(&env, stream_id + 1);
@@ -79,12 +87,29 @@ impl StreamPayContract {
     }
 
     /// Stop an active stream.
-    pub fn stop_stream(env: Env, stream_id: u32) {
+    ///
+    /// `stopper` must be either the stream's payer (always allowed) or the
+    /// recipient (allowed only when `StreamInfo::recipient_can_stop` is `true`).
+    /// The `stopper` address must authorise this call — auth cannot be bypassed.
+    pub fn stop_stream(env: Env, stream_id: u32, stopper: Address) {
         let mut info = get_stream(&env, stream_id);
-        info.payer.require_auth();
         if !info.is_active {
             panic!("stream not active");
         }
+
+        // Enforce OR-auth: require the stopper to have signed, then verify
+        // they are a permitted party.  This order ensures auth is always
+        // checked before any permission logic, preventing bypass.
+        stopper.require_auth();
+
+        if stopper == info.payer {
+            // Payer is always allowed — no further check needed.
+        } else if stopper == info.recipient && info.recipient_can_stop {
+            // Recipient is allowed only when the flag was set at creation.
+        } else {
+            panic!("not authorised to stop stream");
+        }
+
         info.is_active = false;
         info.end_time = env.ledger().timestamp();
         set_stream(&env, stream_id, &info);
@@ -194,7 +219,7 @@ mod test {
 
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128, &false);
         assert_eq!(stream_id, 1);
 
         let info = client.get_stream_info(&stream_id);
@@ -203,6 +228,7 @@ mod test {
         assert_eq!(info.rate_per_second, 100);
         assert_eq!(info.balance, 10_000);
         assert!(!info.is_active);
+        assert!(!info.recipient_can_stop);
     }
 
     #[test]
@@ -214,11 +240,11 @@ mod test {
 
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &50_i128, &5_000_i128);
+        let stream_id = client.create_stream(&payer, &recipient, &50_i128, &5_000_i128, &false);
         client.start_stream(&stream_id);
         let info = client.get_stream_info(&stream_id);
         assert!(info.is_active);
-        client.stop_stream(&stream_id);
+        client.stop_stream(&stream_id, &payer);
         let info = client.get_stream_info(&stream_id);
         assert!(!info.is_active);
     }
@@ -232,7 +258,7 @@ mod test {
 
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &10_i128, &1_000_i128);
+        let stream_id = client.create_stream(&payer, &recipient, &10_i128, &1_000_i128, &false);
         client.start_stream(&stream_id);
         let amount = client.settle_stream(&stream_id);
         assert!(amount >= 0);
@@ -271,7 +297,7 @@ mod test {
 
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128, &false);
 
         // Verify stream is retrievable (storage works)
         let info = client.get_stream_info(&stream_id);
@@ -287,7 +313,7 @@ mod test {
 
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128, &false);
 
         // Advance ledger by a modest amount — stream should still be alive
         // because create_stream extended its TTL
@@ -310,7 +336,7 @@ mod test {
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
         // rate=100/s, balance=1000 → fully drained after 10s
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &1_000_i128);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &1_000_i128, &false);
         client.start_stream(&stream_id);
 
         // Advance 10 seconds so balance drains to 0
@@ -320,7 +346,7 @@ mod test {
         let amount = client.settle_stream(&stream_id);
         assert_eq!(amount, 1_000);
 
-        client.stop_stream(&stream_id);
+        client.stop_stream(&stream_id, &payer);
         let info = client.get_stream_info(&stream_id);
         assert_eq!(info.balance, 0);
         assert!(!info.is_active);
@@ -339,7 +365,7 @@ mod test {
 
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128, &false);
 
         // Stream is inactive but has balance > 0 — should panic
         // to protect recipient's entitlement
@@ -356,7 +382,7 @@ mod test {
 
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128, &false);
         client.start_stream(&stream_id);
 
         // Should panic — stream is active
@@ -374,16 +400,118 @@ mod test {
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
         // Create, start, drain, stop, then archive
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &1_000_i128);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &1_000_i128, &false);
         client.start_stream(&stream_id);
         env.ledger().with_mut(|li| {
             li.timestamp += 10;
         });
         client.settle_stream(&stream_id);
-        client.stop_stream(&stream_id);
+        client.stop_stream(&stream_id, &payer);
         client.archive_stream(&stream_id);
 
         // Should panic — stream was archived (removed from storage)
         client.get_stream_info(&stream_id);
+    }
+
+    // ── recipient_can_stop tests ──────────────────────────────────────────────
+
+    /// Recipient can stop when the flag is set at creation.
+    #[test]
+    fn test_recipient_can_stop_when_flag_set() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id =
+            client.create_stream(&payer, &recipient, &50_i128, &5_000_i128, &true);
+
+        let info = client.get_stream_info(&stream_id);
+        assert!(info.recipient_can_stop, "flag should be stored as true");
+
+        client.start_stream(&stream_id);
+        // Recipient stops the stream
+        client.stop_stream(&stream_id, &recipient);
+        let info = client.get_stream_info(&stream_id);
+        assert!(!info.is_active);
+    }
+
+    /// Payer can always stop even when recipient_can_stop is true.
+    #[test]
+    fn test_payer_can_stop_when_recipient_flag_set() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id =
+            client.create_stream(&payer, &recipient, &50_i128, &5_000_i128, &true);
+        client.start_stream(&stream_id);
+        // Payer stops — should succeed regardless of flag
+        client.stop_stream(&stream_id, &payer);
+        let info = client.get_stream_info(&stream_id);
+        assert!(!info.is_active);
+    }
+
+    /// Recipient cannot stop when the flag is false (default behaviour).
+    #[test]
+    #[should_panic]
+    fn test_recipient_cannot_stop_when_flag_false() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        // recipient_can_stop = false (default)
+        let stream_id =
+            client.create_stream(&payer, &recipient, &50_i128, &5_000_i128, &false);
+        client.start_stream(&stream_id);
+        // Should panic — recipient not permitted
+        client.stop_stream(&stream_id, &recipient);
+    }
+
+    /// A third-party address cannot stop the stream even if it provides auth.
+    #[test]
+    #[should_panic]
+    fn test_third_party_cannot_stop_stream() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        let stream_id =
+            client.create_stream(&payer, &recipient, &50_i128, &5_000_i128, &true);
+        client.start_stream(&stream_id);
+        // Should panic — attacker is neither payer nor recipient
+        client.stop_stream(&stream_id, &attacker);
+    }
+
+    /// recipient_can_stop flag defaults to false and is stored correctly.
+    #[test]
+    fn test_recipient_can_stop_flag_stored() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        let id_default =
+            client.create_stream(&payer, &recipient, &10_i128, &100_i128, &false);
+        let id_opt_in =
+            client.create_stream(&payer, &recipient, &10_i128, &100_i128, &true);
+
+        assert!(!client.get_stream_info(&id_default).recipient_can_stop);
+        assert!(client.get_stream_info(&id_opt_in).recipient_can_stop);
     }
 }

@@ -8,12 +8,12 @@ This repo contains the on-chain logic for creating, starting, stopping, and sett
 
 ### Contract interface
 
-- **`create_stream(payer, recipient, rate_per_second, initial_balance)`** — Create a new stream (payer must auth).
+- **`create_stream(payer, recipient, rate_per_second, initial_balance, recipient_can_stop)`** — Create a new stream (payer must auth). Set `recipient_can_stop = true` to allow the recipient to also stop the stream; defaults to `false` (payer-only).
 - **`start_stream(stream_id)`** — Start an existing stream.
-- **`stop_stream(stream_id)`** — Stop an active stream.
+- **`stop_stream(stream_id, stopper)`** — Stop an active stream. `stopper` must be the payer (always allowed) or the recipient (only when `recipient_can_stop` was set at creation). `stopper` must authorise the call.
 - **`settle_stream(stream_id)`** — Compute and deduct streamed amount since last settlement; returns amount.
 - **`archive_stream(stream_id)`** — Remove a fully-settled, inactive stream from storage (payer must auth).
-- **`get_stream_info(stream_id)`** — Read stream metadata (payer, recipient, rate, balance, timestamps, active).
+- **`get_stream_info(stream_id)`** — Read stream metadata (payer, recipient, rate, balance, timestamps, active, recipient_can_stop).
 - **`version()`** — Returns the contract version as a `u32` (no auth required).
 
 ## Storage Model
