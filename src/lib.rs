@@ -3,7 +3,7 @@
 //! Provides: create_stream, start_stream, stop_stream, settle_stream,
 //! archive_stream, get_stream_info, version.
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec};
 
 /// Contract version: major * 1_000_000 + minor * 1_000 + patch.
 /// Current: 0.1.0 → 1_000
@@ -17,6 +17,9 @@ const STREAM_TTL_EXTEND: u32 = 518_400;
 const INSTANCE_TTL_THRESHOLD: u32 = 17_280;
 /// Instance storage TTL extend-to (~30 days).
 const INSTANCE_TTL_EXTEND: u32 = 518_400;
+
+const PAYER_INDEX: Symbol = symbol_short!("PAYER_IDX");
+const MAX_STREAMS_PER_PAYER: u32 = 50;
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -59,6 +62,7 @@ impl StreamPayContract {
         };
         set_stream(&env, stream_id, &info);
         set_next_stream_id(&env, stream_id + 1);
+        add_stream_to_payer_index(&env, payer, stream_id);
         extend_stream_ttl(&env, stream_id);
         extend_instance_ttl(&env);
         stream_id
@@ -116,6 +120,14 @@ impl StreamPayContract {
         get_stream(&env, stream_id)
     }
 
+    /// Get all stream IDs for a specific payer (capped).
+    pub fn get_streams_by_payer(env: Env, payer: Address) -> Vec<u32> {
+        env.storage()
+            .persistent()
+            .get(&(PAYER_INDEX, payer))
+            .unwrap_or(Vec::new(&env))
+    }
+
     /// Returns the contract version as a u32 (see VERSION encoding).
     pub fn version(_env: Env) -> u32 {
         VERSION
@@ -163,6 +175,24 @@ fn get_next_stream_id(env: &Env) -> u32 {
 fn set_next_stream_id(env: &Env, id: u32) {
     let key = Symbol::new(env, "next_id");
     env.storage().instance().set(&key, &id);
+}
+
+fn add_stream_to_payer_index(env: &Env, payer: Address, stream_id: u32) {
+    let mut streams: Vec<u32> = env
+        .storage()
+        .persistent()
+        .get(&(PAYER_INDEX, payer.clone()))
+        .unwrap_or(Vec::new(env));
+
+    if streams.len() >= MAX_STREAMS_PER_PAYER {
+        streams.remove(0);
+    }
+
+    streams.push_back(stream_id);
+
+    env.storage()
+        .persistent()
+        .set(&(PAYER_INDEX, payer), &streams);
 }
 
 fn extend_stream_ttl(env: &Env, stream_id: u32) {
