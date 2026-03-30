@@ -386,4 +386,109 @@ mod test {
         // Should panic — stream was archived (removed from storage)
         client.get_stream_info(&stream_id);
     }
+
+    /// Regression: settle_stream on a never-started (inactive) stream returns 0.
+    #[test]
+    fn test_settle_inactive_returns_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+
+        // Stream is inactive — settle must return 0
+        let amount = client.settle_stream(&stream_id);
+        assert_eq!(amount, 0);
+    }
+
+    /// Regression: settle_stream on an inactive stream must not corrupt any StreamInfo field.
+    #[test]
+    fn test_settle_inactive_storage_unchanged() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+
+        let before = client.get_stream_info(&stream_id);
+        client.settle_stream(&stream_id);
+        let after = client.get_stream_info(&stream_id);
+
+        assert_eq!(after.payer, before.payer);
+        assert_eq!(after.recipient, before.recipient);
+        assert_eq!(after.rate_per_second, before.rate_per_second);
+        assert_eq!(after.balance, before.balance);
+        assert_eq!(after.start_time, before.start_time);
+        assert_eq!(after.end_time, before.end_time);
+        assert_eq!(after.is_active, before.is_active);
+    }
+
+    /// Regression: multiple settle_stream calls on an inactive stream are idempotent —
+    /// each returns 0 and storage remains uncorrupted throughout.
+    #[test]
+    fn test_settle_inactive_idempotent() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+
+        let before = client.get_stream_info(&stream_id);
+
+        // Call settle multiple times on an inactive stream
+        for _ in 0..5 {
+            let amount = client.settle_stream(&stream_id);
+            assert_eq!(amount, 0);
+        }
+
+        let after = client.get_stream_info(&stream_id);
+        assert_eq!(after.balance, before.balance);
+        assert_eq!(after.start_time, before.start_time);
+        assert_eq!(after.is_active, before.is_active);
+        assert_eq!(after.rate_per_second, before.rate_per_second);
+    }
+
+    /// Regression: settle_stream on a stopped (was active, now inactive) stream returns 0.
+    #[test]
+    fn test_settle_stopped_stream_returns_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &10_i128, &1_000_i128);
+        client.start_stream(&stream_id);
+
+        // Advance time and settle while active
+        env.ledger().with_mut(|li| {
+            li.timestamp += 5;
+        });
+        let first_settle = client.settle_stream(&stream_id);
+        assert!(first_settle > 0);
+
+        // Stop the stream — now inactive
+        client.stop_stream(&stream_id);
+        let before_stopped = client.get_stream_info(&stream_id);
+        assert!(!before_stopped.is_active);
+
+        // settle on stopped stream must return 0 and not change storage
+        let amount = client.settle_stream(&stream_id);
+        assert_eq!(amount, 0);
+
+        let after = client.get_stream_info(&stream_id);
+        assert_eq!(after.balance, before_stopped.balance);
+        assert_eq!(after.start_time, before_stopped.start_time);
+        assert_eq!(after.is_active, before_stopped.is_active);
+    }
 }
