@@ -3,7 +3,7 @@
 //! Provides: create_stream, start_stream, stop_stream, settle_stream,
 //! archive_stream, get_stream_info, version.
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, Vec};
 
 /// Contract version: major * 1_000_000 + minor * 1_000 + patch.
 /// Current: 0.1.0 → 1_000
@@ -28,6 +28,21 @@ pub struct StreamInfo {
     pub start_time: u64,
     pub end_time: u64,
     pub is_active: bool,
+}
+
+/// Event data emitted when a new stream is created.
+///
+/// Topics: `["stream_created", stream_id]`
+/// Data:   `StreamCreatedEvent { payer, recipient, rate_per_second, initial_balance }`
+///
+/// Indexers can filter on topic[0] == "stream_created" and topic[1] == stream_id.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct StreamCreatedEvent {
+    pub payer: Address,
+    pub recipient: Address,
+    pub rate_per_second: i128,
+    pub initial_balance: i128,
 }
 
 #[contract]
@@ -61,6 +76,7 @@ impl StreamPayContract {
         set_next_stream_id(&env, stream_id + 1);
         extend_stream_ttl(&env, stream_id);
         extend_instance_ttl(&env);
+        emit_stream_created(&env, stream_id, &payer, &info.recipient, rate_per_second, initial_balance);
         stream_id
     }
 
@@ -138,6 +154,34 @@ impl StreamPayContract {
     }
 }
 
+/// Emit a `stream_created` contract event.
+///
+/// Topics (indexer-friendly, low-cost):
+///   - `"stream_created"` — event discriminator
+///   - `stream_id`        — numeric stream identifier
+///
+/// Data payload: [`StreamCreatedEvent`] containing payer, recipient,
+/// rate_per_second, and initial_balance.
+fn emit_stream_created(
+    env: &Env,
+    stream_id: u32,
+    payer: &Address,
+    recipient: &Address,
+    rate_per_second: i128,
+    initial_balance: i128,
+) {
+    let mut topics = Vec::new(env);
+    topics.push_back(Symbol::new(env, "stream_created"));
+    topics.push_back(stream_id);
+    let data = StreamCreatedEvent {
+        payer: payer.clone(),
+        recipient: recipient.clone(),
+        rate_per_second,
+        initial_balance,
+    };
+    env.events().publish(topics, data);
+}
+
 fn stream_key(env: &Env, stream_id: u32) -> (Symbol, u32) {
     (Symbol::new(env, "stream"), stream_id)
 }
@@ -203,6 +247,66 @@ mod test {
         assert_eq!(info.rate_per_second, 100);
         assert_eq!(info.balance, 10_000);
         assert!(!info.is_active);
+    }
+
+    /// Verify that `create_stream` emits exactly one `stream_created` event
+    /// with the correct topics and data payload.
+    #[test]
+    fn test_create_stream_emits_event() {
+        use soroban_sdk::testutils::Events as _;
+
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+
+        let events = env.events().all();
+        // Exactly one event should have been emitted
+        assert_eq!(events.len(), 1);
+
+        let (emitting_contract, topics, data) = events.get(0).unwrap();
+        assert_eq!(emitting_contract, contract_id);
+
+        // topic[0] == "stream_created", topic[1] == stream_id
+        let topic0: Symbol = topics.get(0).unwrap();
+        let topic1: u32 = topics.get(1).unwrap();
+        assert_eq!(topic0, Symbol::new(&env, "stream_created"));
+        assert_eq!(topic1, stream_id);
+
+        // Data payload carries all four fields
+        let event_data: StreamCreatedEvent = soroban_sdk::FromVal::from_val(&env, &data);
+        assert_eq!(event_data.payer, payer);
+        assert_eq!(event_data.recipient, recipient);
+        assert_eq!(event_data.rate_per_second, 100);
+        assert_eq!(event_data.initial_balance, 10_000);
+    }
+
+    /// Only `create_stream` emits an event; start/stop must not emit
+    /// spurious `stream_created` events.
+    #[test]
+    fn test_no_spurious_stream_created_events() {
+        use soroban_sdk::testutils::Events as _;
+
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &10_i128, &1_000_i128);
+
+        let after_create = env.events().all().len();
+        assert_eq!(after_create, 1);
+
+        // start / stop must not add more stream_created events
+        client.start_stream(&stream_id);
+        client.stop_stream(&stream_id);
+        assert_eq!(env.events().all().len(), after_create);
     }
 
     #[test]
