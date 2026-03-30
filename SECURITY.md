@@ -10,3 +10,6 @@ Instead, use GitHub’s private vulnerability reporting for this repository (Sec
 
 Security fixes are applied to the latest `main` branch.
 
+## Threat assessment
+
+For a detailed analysis of potential attack vectors, mitigations, and systemic risks, please refer to our [Threat Model](docs/threat-model.md).
