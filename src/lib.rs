@@ -99,16 +99,21 @@ impl StreamPayContract {
             return 0;
         }
         let now = env.ledger().timestamp();
-        let elapsed = now - info.start_time;
-        let amount = (elapsed as i128)
-            .saturating_mul(info.rate_per_second)
-            .min(info.balance);
+        let amount = compute_accrued_amount(&info, now);
         info.balance = info.balance.saturating_sub(amount);
         info.start_time = now;
         set_stream(&env, stream_id, &info);
         extend_stream_ttl(&env, stream_id);
         extend_instance_ttl(&env);
         amount
+    }
+
+    /// View-only: returns the accrued amount that `settle_stream` would pay
+    /// at the current ledger timestamp without mutating storage.
+    pub fn accrued_amount(env: Env, stream_id: u32) -> i128 {
+        let info = get_stream(&env, stream_id);
+        let now = env.ledger().timestamp();
+        compute_accrued_amount(&info, now)
     }
 
     /// Get stream info (read-only).
@@ -176,6 +181,17 @@ fn extend_instance_ttl(env: &Env) {
     env.storage()
         .instance()
         .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND);
+}
+
+/// Shared accrual computation used by `settle_stream` and `accrued_amount`.
+fn compute_accrued_amount(info: &StreamInfo, now: u64) -> i128 {
+    if !info.is_active {
+        return 0;
+    }
+    let elapsed = now - info.start_time;
+    (elapsed as i128)
+        .saturating_mul(info.rate_per_second)
+        .min(info.balance)
 }
 
 #[cfg(test)]
@@ -385,5 +401,63 @@ mod test {
 
         // Should panic — stream was archived (removed from storage)
         client.get_stream_info(&stream_id);
+    }
+
+    #[test]
+    fn test_accrued_amount_view_matches_settle_same_second() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &10_i128, &1_000_i128);
+        client.start_stream(&stream_id);
+
+        // Advance ledger a bit
+        env.ledger().with_mut(|li| {
+            li.timestamp += 5;
+        });
+
+        let view_amount = client.accrued_amount(&stream_id);
+        let settle_amount = client.settle_stream(&stream_id);
+        assert_eq!(view_amount, settle_amount);
+    }
+
+    #[test]
+    fn test_accrued_amount_capped_by_balance() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        // rate=100/s, balance=1000 → after 20s should cap at 1000
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &1_000_i128);
+        client.start_stream(&stream_id);
+        env.ledger().with_mut(|li| {
+            li.timestamp += 20;
+        });
+        let view_amount = client.accrued_amount(&stream_id);
+        assert_eq!(view_amount, 1_000_i128);
+        let settle_amount = client.settle_stream(&stream_id);
+        assert_eq!(settle_amount, 1_000_i128);
+    }
+
+    #[test]
+    fn test_accrued_amount_inactive_returns_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &10_i128, &1_000_i128);
+        // not started, should be zero
+        let view_amount = client.accrued_amount(&stream_id);
+        assert_eq!(view_amount, 0_i128);
     }
 }
