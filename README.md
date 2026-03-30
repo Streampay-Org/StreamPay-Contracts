@@ -9,12 +9,19 @@ This repo contains the on-chain logic for creating, starting, stopping, and sett
 ### Contract interface
 
 - **`create_stream(payer, recipient, rate_per_second, initial_balance)`** — Create a new stream (payer must auth).
+- **`create_vesting_stream(payer, recipient, initial_balance, duration_seconds)`** — Create a stream that unlocks linearly over a fixed vesting duration.
 - **`start_stream(stream_id)`** — Start an existing stream.
 - **`stop_stream(stream_id)`** — Stop an active stream.
 - **`settle_stream(stream_id)`** — Compute and deduct streamed amount since last settlement; returns amount.
 - **`archive_stream(stream_id)`** — Remove a fully-settled, inactive stream from storage (payer must auth).
 - **`get_stream_info(stream_id)`** — Read stream metadata (payer, recipient, rate, balance, timestamps, active).
 - **`version()`** — Returns the contract version as a `u32` (no auth required).
+
+### Unlock mode invariants
+
+- `create_stream` uses basic per-second settlement from elapsed wall time.
+- `create_vesting_stream` uses cumulative linear vesting from first activation time.
+- In vesting mode, `vested_amount` is monotonic and cannot exceed the stream total.
 
 ## Storage Model
 

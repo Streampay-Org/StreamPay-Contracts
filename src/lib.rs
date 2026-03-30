@@ -18,6 +18,26 @@ const INSTANCE_TTL_THRESHOLD: u32 = 17_280;
 /// Instance storage TTL extend-to (~30 days).
 const INSTANCE_TTL_EXTEND: u32 = 518_400;
 
+/// Stream unlock mode.
+///
+/// Invariants:
+/// - `BasicRate` unlocks from elapsed wall time using `rate_per_second`.
+/// - `LinearVesting` unlocks as a cumulative linear function of
+///   `total_amount * elapsed / duration_seconds` from the first start time.
+/// - For `LinearVesting`, `vested_amount` is monotonic and never exceeds
+///   `total_amount`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StreamMode {
+    BasicRate,
+    LinearVesting {
+        total_amount: i128,
+        duration_seconds: u64,
+        vested_amount: i128,
+        vesting_start_time: u64,
+    },
+}
+
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct StreamInfo {
@@ -28,6 +48,7 @@ pub struct StreamInfo {
     pub start_time: u64,
     pub end_time: u64,
     pub is_active: bool,
+    pub mode: StreamMode,
 }
 
 #[contract]
@@ -56,6 +77,46 @@ impl StreamPayContract {
             start_time: 0,
             end_time: 0,
             is_active: false,
+            mode: StreamMode::BasicRate,
+        };
+        set_stream(&env, stream_id, &info);
+        set_next_stream_id(&env, stream_id + 1);
+        extend_stream_ttl(&env, stream_id);
+        extend_instance_ttl(&env);
+        stream_id
+    }
+
+    /// Create a stream with linear vesting unlock mode.
+    ///
+    /// Unlock amount is derived from elapsed schedule time and not from a
+    /// caller-supplied `rate_per_second`.
+    pub fn create_vesting_stream(
+        env: Env,
+        payer: Address,
+        recipient: Address,
+        initial_balance: i128,
+        duration_seconds: u64,
+    ) -> u32 {
+        payer.require_auth();
+        if initial_balance <= 0 || duration_seconds == 0 {
+            panic!("balance and duration must be positive");
+        }
+
+        let stream_id = get_next_stream_id(&env);
+        let info = StreamInfo {
+            payer: payer.clone(),
+            recipient,
+            rate_per_second: 0,
+            balance: initial_balance,
+            start_time: 0,
+            end_time: 0,
+            is_active: false,
+            mode: StreamMode::LinearVesting {
+                total_amount: initial_balance,
+                duration_seconds,
+                vested_amount: 0,
+                vesting_start_time: 0,
+            },
         };
         set_stream(&env, stream_id, &info);
         set_next_stream_id(&env, stream_id + 1);
@@ -71,8 +132,28 @@ impl StreamPayContract {
         if info.is_active {
             panic!("stream already active");
         }
+        let now = env.ledger().timestamp();
         info.is_active = true;
-        info.start_time = env.ledger().timestamp();
+        info.start_time = now;
+        if let StreamMode::LinearVesting {
+            total_amount,
+            duration_seconds,
+            vested_amount,
+            vesting_start_time,
+        } = info.mode.clone()
+        {
+            let anchored_start = if vesting_start_time == 0 {
+                now
+            } else {
+                vesting_start_time
+            };
+            info.mode = StreamMode::LinearVesting {
+                total_amount,
+                duration_seconds,
+                vested_amount,
+                vesting_start_time: anchored_start,
+            };
+        }
         set_stream(&env, stream_id, &info);
         extend_stream_ttl(&env, stream_id);
         extend_instance_ttl(&env);
@@ -99,12 +180,39 @@ impl StreamPayContract {
             return 0;
         }
         let now = env.ledger().timestamp();
-        let elapsed = now - info.start_time;
-        let amount = (elapsed as i128)
-            .saturating_mul(info.rate_per_second)
-            .min(info.balance);
+        let amount = match info.mode.clone() {
+            StreamMode::BasicRate => {
+                let elapsed = now.saturating_sub(info.start_time);
+                let amount = (elapsed as i128)
+                    .saturating_mul(info.rate_per_second)
+                    .min(info.balance);
+                info.start_time = now;
+                amount
+            }
+            StreamMode::LinearVesting {
+                total_amount,
+                duration_seconds,
+                vested_amount,
+                vesting_start_time,
+            } => {
+                if duration_seconds == 0 {
+                    panic!("invalid vesting duration");
+                }
+                let elapsed = now.saturating_sub(vesting_start_time);
+                let total_vested = compute_linear_vested(total_amount, duration_seconds, elapsed);
+                let newly_vested = total_vested.saturating_sub(vested_amount);
+                let amount = newly_vested.min(info.balance);
+
+                info.mode = StreamMode::LinearVesting {
+                    total_amount,
+                    duration_seconds,
+                    vested_amount: vested_amount.saturating_add(amount),
+                    vesting_start_time,
+                };
+                amount
+            }
+        };
         info.balance = info.balance.saturating_sub(amount);
-        info.start_time = now;
         set_stream(&env, stream_id, &info);
         extend_stream_ttl(&env, stream_id);
         extend_instance_ttl(&env);
@@ -178,6 +286,15 @@ fn extend_instance_ttl(env: &Env) {
         .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND);
 }
 
+fn compute_linear_vested(total_amount: i128, duration_seconds: u64, elapsed_seconds: u64) -> i128 {
+    let capped_elapsed = if elapsed_seconds > duration_seconds {
+        duration_seconds
+    } else {
+        elapsed_seconds
+    };
+    total_amount.saturating_mul(capped_elapsed as i128) / duration_seconds as i128
+}
+
 #[cfg(test)]
 mod test {
     use soroban_sdk::testutils::Address as _;
@@ -203,6 +320,48 @@ mod test {
         assert_eq!(info.rate_per_second, 100);
         assert_eq!(info.balance, 10_000);
         assert!(!info.is_active);
+        assert_eq!(info.mode, StreamMode::BasicRate);
+    }
+
+    #[test]
+    fn test_create_vesting_stream_valid() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_vesting_stream(&payer, &recipient, &10_000_i128, &100_u64);
+
+        let info = client.get_stream_info(&stream_id);
+        assert_eq!(info.payer, payer);
+        assert_eq!(info.recipient, recipient);
+        assert_eq!(info.rate_per_second, 0);
+        assert_eq!(info.balance, 10_000);
+        assert!(!info.is_active);
+        assert_eq!(
+            info.mode,
+            StreamMode::LinearVesting {
+                total_amount: 10_000,
+                duration_seconds: 100,
+                vested_amount: 0,
+                vesting_start_time: 0,
+            }
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_create_vesting_stream_zero_duration_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        client.create_vesting_stream(&payer, &recipient, &10_000_i128, &0_u64);
     }
 
     #[test]
@@ -236,6 +395,119 @@ mod test {
         client.start_stream(&stream_id);
         let amount = client.settle_stream(&stream_id);
         assert!(amount >= 0);
+    }
+
+    #[test]
+    fn test_vesting_unlocks_linearly_across_multiple_settlements() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_vesting_stream(&payer, &recipient, &1_000_i128, &100_u64);
+        client.start_stream(&stream_id);
+
+        env.ledger().with_mut(|li| {
+            li.timestamp += 10;
+        });
+        let first = client.settle_stream(&stream_id);
+        assert_eq!(first, 100);
+
+        env.ledger().with_mut(|li| {
+            li.timestamp += 40;
+        });
+        let second = client.settle_stream(&stream_id);
+        assert_eq!(second, 400);
+
+        let info = client.get_stream_info(&stream_id);
+        assert_eq!(info.balance, 500);
+        if let StreamMode::LinearVesting { vested_amount, .. } = info.mode {
+            assert_eq!(vested_amount, 500);
+        } else {
+            panic!("expected linear vesting mode");
+        }
+    }
+
+    #[test]
+    fn test_vesting_releases_rounding_remainder_at_end() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_vesting_stream(&payer, &recipient, &1_000_i128, &3_u64);
+        client.start_stream(&stream_id);
+
+        env.ledger().with_mut(|li| {
+            li.timestamp += 1;
+        });
+        assert_eq!(client.settle_stream(&stream_id), 333);
+
+        env.ledger().with_mut(|li| {
+            li.timestamp += 1;
+        });
+        assert_eq!(client.settle_stream(&stream_id), 333);
+
+        env.ledger().with_mut(|li| {
+            li.timestamp += 1;
+        });
+        assert_eq!(client.settle_stream(&stream_id), 334);
+
+        let info = client.get_stream_info(&stream_id);
+        assert_eq!(info.balance, 0);
+    }
+
+    #[test]
+    fn test_vesting_schedule_anchor_persists_across_restart() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_vesting_stream(&payer, &recipient, &1_000_i128, &100_u64);
+        client.start_stream(&stream_id);
+
+        env.ledger().with_mut(|li| {
+            li.timestamp += 10;
+        });
+        client.stop_stream(&stream_id);
+
+        env.ledger().with_mut(|li| {
+            li.timestamp += 20;
+        });
+        client.start_stream(&stream_id);
+
+        // Vesting is anchored to the first start time, so 30% is now claimable.
+        let amount = client.settle_stream(&stream_id);
+        assert_eq!(amount, 300);
+    }
+
+    #[test]
+    fn test_vesting_unlocks_full_balance_after_duration() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_vesting_stream(&payer, &recipient, &1_000_i128, &10_u64);
+        client.start_stream(&stream_id);
+
+        env.ledger().with_mut(|li| {
+            li.timestamp += 15;
+        });
+        let amount = client.settle_stream(&stream_id);
+        assert_eq!(amount, 1_000);
+
+        let info = client.get_stream_info(&stream_id);
+        assert_eq!(info.balance, 0);
     }
 
     #[test]
