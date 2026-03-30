@@ -417,7 +417,7 @@ mod test {
 
     #[test]
     #[should_panic(expected = "not authorized")]
-    fn test_operator_revocation() {
+    fn test_non_operator_cannot_settle_stream() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(StreamPayContract, ());
@@ -425,17 +425,29 @@ mod test {
 
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let operator = Address::generate(&env);
+        let non_operator = Address::generate(&env);
         let stream_id = client.create_stream(&payer, &recipient, &10_i128, &1_000_i128);
+        client.start_stream(&payer, &stream_id);
 
-        // Set operator
-        client.set_operator(&stream_id, &Some(operator.clone()));
+        // Non-operator cannot settle
+        client.settle_stream(&non_operator, &stream_id);
+    }
 
-        // Revoke operator
-        client.set_operator(&stream_id, &None);
+    #[test]
+    #[should_panic(expected = "not authorized")]
+    fn test_recipient_cannot_settle_stream() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
 
-        // Operator cannot start after revocation
-        client.start_stream(&operator, &stream_id);
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &10_i128, &1_000_i128);
+        client.start_stream(&payer, &stream_id);
+
+        // Recipient cannot settle
+        client.settle_stream(&recipient, &stream_id);
     }
 
     #[test]
