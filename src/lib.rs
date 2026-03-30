@@ -72,8 +72,15 @@ impl StreamPayContract {
             panic!("stream already active");
         }
         info.is_active = true;
-        info.start_time = env.ledger().timestamp();
+        let timestamp = env.ledger().timestamp();
+        info.start_time = timestamp;
         set_stream(&env, stream_id, &info);
+
+        env.events().publish(
+            (Symbol::new(&env, "stream_started"),),
+            (stream_id, timestamp),
+        );
+
         extend_stream_ttl(&env, stream_id);
         extend_instance_ttl(&env);
     }
@@ -86,8 +93,15 @@ impl StreamPayContract {
             panic!("stream not active");
         }
         info.is_active = false;
-        info.end_time = env.ledger().timestamp();
+        let timestamp = env.ledger().timestamp();
+        info.end_time = timestamp;
         set_stream(&env, stream_id, &info);
+
+        env.events().publish(
+            (Symbol::new(&env, "stream_stopped"),),
+            (stream_id, timestamp),
+        );
+
         extend_stream_ttl(&env, stream_id);
         extend_instance_ttl(&env);
     }
