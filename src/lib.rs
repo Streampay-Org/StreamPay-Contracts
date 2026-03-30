@@ -206,6 +206,58 @@ mod test {
     }
 
     #[test]
+    #[should_panic(expected = "rate and balance must be positive")]
+    fn test_create_stream_zero_rate_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        client.create_stream(&payer, &recipient, &0_i128, &10_000_i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "rate and balance must be positive")]
+    fn test_create_stream_negative_rate_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        client.create_stream(&payer, &recipient, &-1_i128, &10_000_i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "rate and balance must be positive")]
+    fn test_create_stream_zero_balance_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        client.create_stream(&payer, &recipient, &100_i128, &0_i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "rate and balance must be positive")]
+    fn test_create_stream_negative_balance_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        client.create_stream(&payer, &recipient, &100_i128, &-1_i128);
+    }
+
+    #[test]
     fn test_start_and_stop_stream() {
         let env = Env::default();
         env.mock_all_auths();
