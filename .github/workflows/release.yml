@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93.0"
+          components: rustfmt
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Validate tag matches Cargo.toml version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag version ($TAG_VERSION) does not match Cargo.toml version ($CARGO_VERSION)"
+            exit 1
+          fi
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Build deterministic WASM
+        run: |
+          docker build --platform linux/amd64 \
+            -f docker/Dockerfile.build \
+            -o artifacts .
+
+      - name: Install git-cliff
+        uses: kenji-miyake/setup-git-cliff@v2
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          TAG_COUNT=$(git tag -l 'v*' | wc -l)
+          if [ "$TAG_COUNT" -le 1 ]; then
+            git-cliff --tag "$GITHUB_REF_NAME" > RELEASE_NOTES.md
+          else
+            git-cliff --latest > RELEASE_NOTES.md
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file RELEASE_NOTES.md \
+            artifacts/streampay_contracts.optimized.wasm \
+            artifacts/streampay_contracts.checksum
