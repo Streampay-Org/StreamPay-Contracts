@@ -12,6 +12,7 @@ This repo contains the on-chain logic for creating, starting, stopping, and sett
 - **`start_stream(stream_id)`** — Start an existing stream.
 - **`stop_stream(stream_id)`** — Stop an active stream.
 - **`settle_stream(stream_id)`** — Compute and deduct streamed amount since last settlement; returns amount.
+- **`update_rate(stream_id, new_rate)`** — Update stream rate mid-stream (payer must auth). Automatically settles at old rate first if active. Policy: max 10% increase allowed, unlimited decrease.
 - **`archive_stream(stream_id)`** — Remove a fully-settled, inactive stream from storage (payer must auth).
 - **`get_stream_info(stream_id)`** — Read stream metadata (payer, recipient, rate, balance, timestamps, active).
 - **`version()`** — Returns the contract version as a `u32` (no auth required).
