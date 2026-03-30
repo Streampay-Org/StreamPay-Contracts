@@ -1,7 +1,9 @@
 //! StreamPay — Soroban smart contracts for continuous payment streaming.
 //!
 //! Provides: create_stream, start_stream, stop_stream, settle_stream,
-//! archive_stream, get_stream_info, version.
+//! archive_stream, get_stream_info, set_operator, version.
+//!
+//! Operator delegation: Payers can designate operators to manage their streams.
 
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
 
@@ -28,6 +30,7 @@ pub struct StreamInfo {
     pub start_time: u64,
     pub end_time: u64,
     pub is_active: bool,
+    pub operator: Option<Address>,
 }
 
 #[contracttype]
@@ -64,6 +67,7 @@ impl StreamPayContract {
             start_time: 0,
             end_time: 0,
             is_active: false,
+            operator: None,
         };
         set_stream(&env, stream_id, &info);
         set_next_stream_id(&env, stream_id + 1);
@@ -72,10 +76,23 @@ impl StreamPayContract {
         stream_id
     }
 
-    /// Start an existing stream.
-    pub fn start_stream(env: Env, stream_id: u32) {
+    /// Set or revoke operator for a stream (payer only).
+    pub fn set_operator(env: Env, stream_id: u32, operator: Option<Address>) {
         let mut info = get_stream(&env, stream_id);
         info.payer.require_auth();
+        info.operator = operator;
+        set_stream(&env, stream_id, &info);
+        extend_stream_ttl(&env, stream_id);
+        extend_instance_ttl(&env);
+    }
+
+    /// Start an existing stream.
+    pub fn start_stream(env: Env, caller: Address, stream_id: u32) {
+        caller.require_auth();
+        let mut info = get_stream(&env, stream_id);
+        if caller != info.payer && info.operator != Some(caller) {
+            panic!("not authorized");
+        }
         if info.is_active {
             panic!("stream already active");
         }
@@ -87,9 +104,12 @@ impl StreamPayContract {
     }
 
     /// Stop an active stream.
-    pub fn stop_stream(env: Env, stream_id: u32) {
+    pub fn stop_stream(env: Env, caller: Address, stream_id: u32) {
+        caller.require_auth();
         let mut info = get_stream(&env, stream_id);
-        info.payer.require_auth();
+        if caller != info.payer && info.operator != Some(caller) {
+            panic!("not authorized");
+        }
         if !info.is_active {
             panic!("stream not active");
         }
@@ -101,8 +121,12 @@ impl StreamPayContract {
     }
 
     /// Settle stream: compute streamed amount since start and deduct from balance.
-    pub fn settle_stream(env: Env, stream_id: u32) -> i128 {
+    pub fn settle_stream(env: Env, caller: Address, stream_id: u32) -> i128 {
+        caller.require_auth();
         let mut info = get_stream(&env, stream_id);
+        if caller != info.payer && info.operator != Some(caller) {
+            panic!("not authorized");
+        }
         if !info.is_active {
             return 0;
         }
@@ -223,6 +247,7 @@ mod test {
         assert_eq!(info.rate_per_second, 100);
         assert_eq!(info.balance, 10_000);
         assert!(!info.is_active);
+        assert_eq!(info.operator, None);
     }
 
     #[test]
@@ -287,10 +312,10 @@ mod test {
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
         let stream_id = client.create_stream(&payer, &recipient, &50_i128, &5_000_i128);
-        client.start_stream(&stream_id);
+        client.start_stream(&payer, &stream_id);
         let info = client.get_stream_info(&stream_id);
         assert!(info.is_active);
-        client.stop_stream(&stream_id);
+        client.stop_stream(&payer, &stream_id);
         let info = client.get_stream_info(&stream_id);
         assert!(!info.is_active);
     }
@@ -305,8 +330,8 @@ mod test {
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
         let stream_id = client.create_stream(&payer, &recipient, &10_i128, &1_000_i128);
-        client.start_stream(&stream_id);
-        let amount = client.settle_stream(&stream_id);
+        client.start_stream(&payer, &stream_id);
+        let amount = client.settle_stream(&payer, &stream_id);
         assert!(amount >= 0);
     }
 
@@ -320,12 +345,12 @@ mod test {
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
         let stream_id = client.create_stream(&payer, &recipient, &10_i128, &1_000_i128);
-        client.start_stream(&stream_id);
+        client.start_stream(&payer, &stream_id);
         // Advance time to allow settlement
         env.ledger().with_mut(|li| {
             li.timestamp += 10;
         });
-        let amount = client.settle_stream(&stream_id);
+        let amount = client.settle_stream(&payer, &stream_id);
         let events = env.events().all();
         assert_eq!(events.len(), 1);
         let (event_contract_id, topics, data) = events.get(0).unwrap().clone();
@@ -336,6 +361,81 @@ mod test {
         assert_eq!(event_data.amount, amount);
         let info = client.get_stream_info(&stream_id);
         assert_eq!(event_data.post_balance, info.balance);
+    }
+
+    #[test]
+    fn test_operator_can_manage_stream() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let operator = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &10_i128, &1_000_i128);
+
+        // Set operator
+        client.set_operator(&stream_id, &Some(operator.clone()));
+
+        // Operator can start
+        client.start_stream(&operator, &stream_id);
+        let info = client.get_stream_info(&stream_id);
+        assert!(info.is_active);
+
+        // Advance time
+        env.ledger().with_mut(|li| {
+            li.timestamp += 10;
+        });
+
+        // Operator can settle
+        let amount = client.settle_stream(&operator, &stream_id);
+        assert_eq!(amount, 100);
+
+        // Operator can stop
+        client.stop_stream(&operator, &stream_id);
+        let info = client.get_stream_info(&stream_id);
+        assert!(!info.is_active);
+    }
+
+    #[test]
+    #[should_panic(expected = "not authorized")]
+    fn test_non_operator_cannot_manage_stream() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let non_operator = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &10_i128, &1_000_i128);
+
+        // Non-operator cannot start
+        client.start_stream(&non_operator, &stream_id);
+    }
+
+    #[test]
+    #[should_panic(expected = "not authorized")]
+    fn test_operator_revocation() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let operator = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &10_i128, &1_000_i128);
+
+        // Set operator
+        client.set_operator(&stream_id, &Some(operator.clone()));
+
+        // Revoke operator
+        client.set_operator(&stream_id, &None);
+
+        // Operator cannot start after revocation
+        client.start_stream(&operator, &stream_id);
     }
 
     #[test]
@@ -411,16 +511,16 @@ mod test {
         let recipient = Address::generate(&env);
         // rate=100/s, balance=1000 → fully drained after 10s
         let stream_id = client.create_stream(&payer, &recipient, &100_i128, &1_000_i128);
-        client.start_stream(&stream_id);
+        client.start_stream(&payer, &stream_id);
 
         // Advance 10 seconds so balance drains to 0
         env.ledger().with_mut(|li| {
             li.timestamp += 10;
         });
-        let amount = client.settle_stream(&stream_id);
+        let amount = client.settle_stream(&payer, &stream_id);
         assert_eq!(amount, 1_000);
 
-        client.stop_stream(&stream_id);
+        client.stop_stream(&payer, &stream_id);
         let info = client.get_stream_info(&stream_id);
         assert_eq!(info.balance, 0);
         assert!(!info.is_active);
@@ -457,7 +557,7 @@ mod test {
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
         let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
-        client.start_stream(&stream_id);
+        client.start_stream(&payer, &stream_id);
 
         // Should panic — stream is active
         client.archive_stream(&stream_id);
@@ -475,12 +575,12 @@ mod test {
         let recipient = Address::generate(&env);
         // Create, start, drain, stop, then archive
         let stream_id = client.create_stream(&payer, &recipient, &100_i128, &1_000_i128);
-        client.start_stream(&stream_id);
+        client.start_stream(&payer, &stream_id);
         env.ledger().with_mut(|li| {
             li.timestamp += 10;
         });
-        client.settle_stream(&stream_id);
-        client.stop_stream(&stream_id);
+        client.settle_stream(&payer, &stream_id);
+        client.stop_stream(&payer, &stream_id);
         client.archive_stream(&stream_id);
 
         // Should panic — stream was archived (removed from storage)

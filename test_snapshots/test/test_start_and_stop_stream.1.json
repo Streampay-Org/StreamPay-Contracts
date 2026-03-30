@@ -49,6 +49,9 @@
               "function_name": "start_stream",
               "args": [
                 {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                },
+                {
                   "u32": 1
                 }
               ]
@@ -68,6 +71,9 @@
               "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
               "function_name": "stop_stream",
               "args": [
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                },
                 {
                   "u32": 1
                 }
@@ -153,6 +159,12 @@
                       "val": {
                         "bool": false
                       }
+                    },
+                    {
+                      "key": {
+                        "symbol": "operator"
+                      },
+                      "val": "void"
                     },
                     {
                       "key": {
