@@ -45,23 +45,29 @@ When releasing, update **both** `Cargo.toml` `version` and the `VERSION` const i
 ## Setup for contributors
 
 1. **Clone and enter the repo**
+
    ```bash
    git clone <repo-url>
    cd streampay-contracts
    ```
 
+
 2. **Install Rust**
+
    ```bash
    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
    rustup component add rustfmt
    ```
 
+
 3. **Verify setup**
+
    ```bash
    cargo fmt --all -- --check
    cargo build
    cargo test
    ```
+
 
 ## Scripts
 
@@ -71,6 +77,18 @@ When releasing, update **both** `Cargo.toml` `version` and the `VERSION` const i
 | `cargo test`   | Run unit tests             |
 | `cargo fmt`    | Format code                |
 | `cargo fmt --all -- --check` | Check formatting (CI) |
+
+
+### Test Harness
+
+StreamPay includes a mock token harness for simulating failure paths (e.g., failed transfers) to test SAC edge cases. This utility is available in `src/test_utils.rs` and is automatically included in test builds.
+
+To run tests with the harness explicitly enabled:
+
+   ```bash
+   cargo test --features testutils
+   ```
+
 
 ## CI/CD
 
@@ -90,7 +108,8 @@ See [docs/RELEASE.md](docs/RELEASE.md) for the full release process, including h
 
 ## Project structure
 
-```
+
+```text
 streampay-contracts/
 ├── src/
 │   └── lib.rs                        # Contract and tests
@@ -107,6 +126,7 @@ streampay-contracts/
 ├── CHANGELOG.md
 └── README.md
 ```
+
 
 ## License
 
