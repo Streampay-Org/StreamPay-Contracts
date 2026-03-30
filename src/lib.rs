@@ -1,9 +1,9 @@
 //! StreamPay — Soroban smart contracts for continuous payment streaming.
 //!
 //! Provides: create_stream, start_stream, stop_stream, settle_stream,
-//! archive_stream, get_stream_info, version.
+//! batch_settle, archive_stream, get_stream_info, version.
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, Vec};
 
 /// Contract version: major * 1_000_000 + minor * 1_000 + patch.
 /// Current: 0.1.0 → 1_000
@@ -17,6 +17,8 @@ const STREAM_TTL_EXTEND: u32 = 518_400;
 const INSTANCE_TTL_THRESHOLD: u32 = 17_280;
 /// Instance storage TTL extend-to (~30 days).
 const INSTANCE_TTL_EXTEND: u32 = 518_400;
+/// Hard cap for batch settlement to keep Soroban resource usage predictable.
+const MAX_BATCH_SETTLE_SIZE: u32 = 25;
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -94,21 +96,43 @@ impl StreamPayContract {
 
     /// Settle stream: compute streamed amount since start and deduct from balance.
     pub fn settle_stream(env: Env, stream_id: u32) -> i128 {
-        let mut info = get_stream(&env, stream_id);
-        if !info.is_active {
+        let amount = settle_stream_amount(&env, stream_id);
+        if amount.is_none() {
             return 0;
         }
-        let now = env.ledger().timestamp();
-        let elapsed = now - info.start_time;
-        let amount = (elapsed as i128)
-            .saturating_mul(info.rate_per_second)
-            .min(info.balance);
-        info.balance = info.balance.saturating_sub(amount);
-        info.start_time = now;
-        set_stream(&env, stream_id, &info);
-        extend_stream_ttl(&env, stream_id);
         extend_instance_ttl(&env);
-        amount
+
+        amount.unwrap()
+    }
+
+    /// Settle multiple streams in a single invocation.
+    ///
+    /// Failure behavior is all-or-nothing: if any item panics, the entire call
+    /// reverts and no settlement state is committed. Callers should chunk larger
+    /// workloads into batches of `MAX_BATCH_SETTLE_SIZE` or fewer ids.
+    pub fn batch_settle(env: Env, stream_ids: Vec<u32>) -> Vec<i128> {
+        if stream_ids.len() > MAX_BATCH_SETTLE_SIZE {
+            panic!("batch too large");
+        }
+
+        let mut settled_amounts = Vec::new(&env);
+        let mut touched_active_stream = false;
+
+        for stream_id in stream_ids.iter() {
+            match settle_stream_amount(&env, stream_id) {
+                Some(amount) => {
+                    touched_active_stream = true;
+                    settled_amounts.push_back(amount);
+                }
+                None => settled_amounts.push_back(0),
+            }
+        }
+
+        if touched_active_stream {
+            extend_instance_ttl(&env);
+        }
+
+        settled_amounts
     }
 
     /// Get stream info (read-only).
@@ -165,6 +189,25 @@ fn set_next_stream_id(env: &Env, id: u32) {
     env.storage().instance().set(&key, &id);
 }
 
+fn settle_stream_amount(env: &Env, stream_id: u32) -> Option<i128> {
+    let mut info = get_stream(env, stream_id);
+    if !info.is_active {
+        return None;
+    }
+
+    let now = env.ledger().timestamp();
+    let elapsed = now - info.start_time;
+    let amount = (elapsed as i128)
+        .saturating_mul(info.rate_per_second)
+        .min(info.balance);
+    info.balance = info.balance.saturating_sub(amount);
+    info.start_time = now;
+    set_stream(env, stream_id, &info);
+    extend_stream_ttl(env, stream_id);
+
+    Some(amount)
+}
+
 fn extend_stream_ttl(env: &Env, stream_id: u32) {
     let key = stream_key(env, stream_id);
     env.storage()
@@ -180,6 +223,8 @@ fn extend_instance_ttl(env: &Env) {
 
 #[cfg(test)]
 mod test {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::testutils::Ledger as _;
 
@@ -236,6 +281,151 @@ mod test {
         client.start_stream(&stream_id);
         let amount = client.settle_stream(&stream_id);
         assert!(amount >= 0);
+    }
+
+    #[test]
+    fn test_batch_settle_empty_vec() {
+        let env = Env::default();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let stream_ids = Vec::new(&env);
+        let amounts = client.batch_settle(&stream_ids);
+
+        assert_eq!(amounts.len(), 0);
+    }
+
+    #[test]
+    fn test_batch_settle_inactive_stream_returns_zero() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &10_i128, &1_000_i128);
+
+        let mut stream_ids = Vec::new(&env);
+        stream_ids.push_back(stream_id);
+
+        let amounts = client.batch_settle(&stream_ids);
+
+        assert_eq!(amounts.len(), 1);
+        assert_eq!(amounts.get(0).unwrap(), 0);
+
+        let info = client.get_stream_info(&stream_id);
+        assert_eq!(info.balance, 1_000);
+        assert!(!info.is_active);
+    }
+
+    #[test]
+    fn test_batch_settle_single_stream() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &10_i128, &1_000_i128);
+        client.start_stream(&stream_id);
+
+        env.ledger().with_mut(|li| {
+            li.timestamp += 10;
+        });
+
+        let mut stream_ids = Vec::new(&env);
+        stream_ids.push_back(stream_id);
+
+        let amounts = client.batch_settle(&stream_ids);
+
+        assert_eq!(amounts.len(), 1);
+        assert_eq!(amounts.get(0).unwrap(), 100);
+
+        let info = client.get_stream_info(&stream_id);
+        assert_eq!(info.balance, 900);
+        assert_eq!(info.start_time, env.ledger().timestamp());
+    }
+
+    #[test]
+    fn test_batch_settle_multiple_streams() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient_a = Address::generate(&env);
+        let recipient_b = Address::generate(&env);
+        let first_stream_id = client.create_stream(&payer, &recipient_a, &10_i128, &1_000_i128);
+        let second_stream_id = client.create_stream(&payer, &recipient_b, &5_i128, &1_000_i128);
+        client.start_stream(&first_stream_id);
+        client.start_stream(&second_stream_id);
+
+        env.ledger().with_mut(|li| {
+            li.timestamp += 10;
+        });
+
+        let mut stream_ids = Vec::new(&env);
+        stream_ids.push_back(first_stream_id);
+        stream_ids.push_back(second_stream_id);
+
+        let amounts = client.batch_settle(&stream_ids);
+
+        assert_eq!(amounts.len(), 2);
+        assert_eq!(amounts.get(0).unwrap(), 100);
+        assert_eq!(amounts.get(1).unwrap(), 50);
+
+        let first_info = client.get_stream_info(&first_stream_id);
+        let second_info = client.get_stream_info(&second_stream_id);
+        assert_eq!(first_info.balance, 900);
+        assert_eq!(second_info.balance, 950);
+    }
+
+    #[test]
+    fn test_batch_settle_missing_id_reverts_all() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &10_i128, &1_000_i128);
+        client.start_stream(&stream_id);
+
+        env.ledger().with_mut(|li| {
+            li.timestamp += 10;
+        });
+
+        let original_info = client.get_stream_info(&stream_id);
+
+        let mut stream_ids = Vec::new(&env);
+        stream_ids.push_back(stream_id);
+        stream_ids.push_back(999_u32);
+
+        let result = catch_unwind(AssertUnwindSafe(|| client.batch_settle(&stream_ids)));
+        assert!(result.is_err());
+
+        let info_after = client.get_stream_info(&stream_id);
+        assert_eq!(info_after.balance, original_info.balance);
+        assert_eq!(info_after.start_time, original_info.start_time);
+    }
+
+    #[test]
+    #[should_panic(expected = "batch too large")]
+    fn test_batch_settle_too_large_panics() {
+        let env = Env::default();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let mut stream_ids = Vec::new(&env);
+        for stream_id in 1..=(MAX_BATCH_SETTLE_SIZE + 1) {
+            stream_ids.push_back(stream_id);
+        }
+
+        client.batch_settle(&stream_ids);
     }
 
     #[test]
