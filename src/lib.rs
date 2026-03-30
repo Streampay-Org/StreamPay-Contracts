@@ -30,6 +30,14 @@ pub struct StreamInfo {
     pub is_active: bool,
 }
 
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SettleEvent {
+    pub stream_id: u32,
+    pub amount: i128,
+    pub post_balance: i128,
+}
+
 #[contract]
 pub struct StreamPayContract;
 
@@ -106,6 +114,16 @@ impl StreamPayContract {
         info.balance = info.balance.saturating_sub(amount);
         info.start_time = now;
         set_stream(&env, stream_id, &info);
+        if amount > 0 {
+            env.events().publish(
+                (Symbol::new(&env, "settle"),),
+                SettleEvent {
+                    stream_id,
+                    amount,
+                    post_balance: info.balance,
+                },
+            );
+        }
         extend_stream_ttl(&env, stream_id);
         extend_instance_ttl(&env);
         amount
@@ -182,6 +200,8 @@ fn extend_instance_ttl(env: &Env) {
 mod test {
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::testutils::Ledger as _;
+    use soroban_sdk::testutils::Events;
+    use soroban_sdk::IntoVal;
 
     use super::*;
 
@@ -288,6 +308,34 @@ mod test {
         client.start_stream(&stream_id);
         let amount = client.settle_stream(&stream_id);
         assert!(amount >= 0);
+    }
+
+    #[test]
+    fn test_settle_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &10_i128, &1_000_i128);
+        client.start_stream(&stream_id);
+        // Advance time to allow settlement
+        env.ledger().with_mut(|li| {
+            li.timestamp += 10;
+        });
+        let amount = client.settle_stream(&stream_id);
+        let events = env.events().all();
+        assert_eq!(events.len(), 1);
+        let (event_contract_id, topics, data) = events.get(0).unwrap().clone();
+        assert_eq!(event_contract_id, contract_id);
+        assert_eq!(topics, soroban_sdk::vec![&env, Symbol::new(&env, "settle").to_val()]);
+        let event_data: SettleEvent = data.into_val(&env);
+        assert_eq!(event_data.stream_id, stream_id);
+        assert_eq!(event_data.amount, amount);
+        let info = client.get_stream_info(&stream_id);
+        assert_eq!(event_data.post_balance, info.balance);
     }
 
     #[test]
