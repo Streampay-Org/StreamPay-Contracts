@@ -1,3 +1,36 @@
+//! # streampay-contracts
+//!
+//! Soroban smart contracts for StreamPay — continuous token streaming on Stellar.
+//!
+//! ---
+//!
+//! ## Ledger Timestamp Assumptions
+//!
+//! All time-based logic in this crate relies on **`Env::ledger().timestamp()`**.
+//!
+//! Key properties:
+//!
+//! - **Whole seconds only.** `u64` Unix timestamp, no sub-second resolution.
+//!   Accrual is always truncated to complete seconds.
+//!
+//! - **~5–6 s ledger cadence.** Timestamp does not advance between ledger closes.
+//!   All transactions in the same ledger share the *same* timestamp.
+//!
+//! - **Validator-set, not caller-set.** Agreed by SCP quorum. No transaction
+//!   sender can influence it. Timestamp-manipulation attacks are not possible.
+//!
+//! - **Monotonic.** Protocol rules guarantee `new >= previous`.
+//!
+//! - **Dust tail.** The fractional-second gap between the last ledger close
+//!   before `end_time` and `end_time` itself is never claimable by the recipient.
+//!   It is reclaimed by the sender on stream close.
+//!
+//! ### Off-chain UX recommendation
+//!
+//! Derive elapsed time from the **last confirmed ledger close time** (Horizon/RPC),
+//! not the device wall clock. Wall-clock interpolation overstates claimable balance.
+//!
+//! See [`docs/timestamp-accrual.md`](../docs/timestamp-accrual.md) for full detail.
 //! StreamPay — Soroban smart contracts for continuous payment streaming.
 //!
 //! Provides: create_stream, start_stream, stop_stream, settle_stream,
