@@ -908,4 +908,3 @@ mod test {
         assert_eq!(info.balance, 0);
     }
 }
-

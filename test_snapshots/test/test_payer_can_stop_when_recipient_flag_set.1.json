@@ -33,7 +33,7 @@
                   }
                 },
                 {
-                  "bool": false
+                  "bool": true
                 }
               ]
             }
@@ -61,7 +61,6 @@
         }
       ]
     ],
-    [],
     [
       [
         "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
@@ -192,7 +191,7 @@
                         "symbol": "recipient_can_stop"
                       },
                       "val": {
-                        "bool": false
+                        "bool": true
                       }
                     },
                     {
