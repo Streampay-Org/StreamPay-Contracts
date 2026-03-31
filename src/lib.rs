@@ -218,6 +218,14 @@ mod test {
 
     use super::*;
 
+    /// Advances the test ledger timestamp by `seconds` so accrual scenarios
+    /// can assert deterministic elapsed-time behavior.
+    fn advance_ledger_time(env: &Env, seconds: u64) {
+        env.ledger().with_mut(|li| {
+            li.timestamp += seconds;
+        });
+    }
+
     #[test]
     fn test_create_stream_valid() {
         let env = Env::default();
@@ -267,8 +275,9 @@ mod test {
         let recipient = Address::generate(&env);
         let stream_id = client.create_stream(&payer, &recipient, &10_i128, &1_000_i128);
         client.start_stream(&stream_id);
+        advance_ledger_time(&env, 10);
         let amount = client.settle_stream(&stream_id);
-        assert!(amount >= 0);
+        assert_eq!(amount, 100);
     }
 
     #[test]
@@ -347,9 +356,7 @@ mod test {
         client.start_stream(&stream_id);
 
         // Advance 10 seconds so balance drains to 0
-        env.ledger().with_mut(|li| {
-            li.timestamp += 10;
-        });
+        advance_ledger_time(&env, 10);
         let amount = client.settle_stream(&stream_id);
         assert_eq!(amount, 1_000);
 
@@ -409,9 +416,7 @@ mod test {
         // Create, start, drain, stop, then archive
         let stream_id = client.create_stream(&payer, &recipient, &100_i128, &1_000_i128);
         client.start_stream(&stream_id);
-        env.ledger().with_mut(|li| {
-            li.timestamp += 10;
-        });
+        advance_ledger_time(&env, 10);
         client.settle_stream(&stream_id);
         client.stop_stream(&stream_id);
         client.archive_stream(&stream_id);
