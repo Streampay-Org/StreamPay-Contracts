@@ -31,6 +31,9 @@
                     "hi": 0,
                     "lo": 10000
                   }
+                },
+                {
+                  "bool": false
                 }
               ]
             }
@@ -144,10 +147,10 @@
                     },
                     {
                       "key": {
-                        "symbol": "schema_version"
+                        "symbol": "recipient_can_stop"
                       },
                       "val": {
-                        "u32": 1
+                        "bool": false
                       }
                     },
                     {
