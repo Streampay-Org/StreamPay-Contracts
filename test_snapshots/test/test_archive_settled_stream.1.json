@@ -31,6 +31,9 @@
                     "hi": 0,
                     "lo": 1000
                   }
+                },
+                {
+                  "bool": false
                 }
               ]
             }
@@ -70,6 +73,9 @@
               "args": [
                 {
                   "u32": 1
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 }
               ]
             }

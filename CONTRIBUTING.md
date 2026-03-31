@@ -23,12 +23,33 @@ This repository contains the `streampay-contracts` Soroban smart contract crate.
 
 This repo pins `soroban-sdk` to **`22.0`** (see `Cargo.toml`). Please keep PRs compatible with that version unless the PR is explicitly upgrading the SDK.
 
+### Dependency policy
+
+This project uses [`cargo-deny`](https://github.com/EmbarkStudios/cargo-deny) to audit dependencies for:
+
+- **License compliance** — only OSI/FSF-approved permissive licenses are allowed (MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, and a few others listed in `deny.toml`).
+- **Security advisories** — known vulnerabilities and yanked crates are blocked; unmaintained crates emit a warning.
+- **Source policy** — only crates.io is allowed as a registry.
+
+Install and run locally before adding or updating any dependency:
+
+```bash
+cargo install cargo-deny
+cargo deny check
+```
+
+If `cargo deny check` fails:
+
+- **License violation** — open an issue to discuss whether to add an exception or choose a different crate.
+- **Security advisory** — do not merge; update or replace the affected dependency first.
+
 ### Build, format, test (required)
 
 Run these locally before opening a PR:
 
 ```bash
 cargo fmt --all -- --check
+cargo deny check
 cargo build
 cargo test
 ```
