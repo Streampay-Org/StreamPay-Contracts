@@ -595,6 +595,54 @@ mod test {
     }
 
     #[test]
+    #[should_panic(expected = "stream not active")]
+    fn test_stop_stream_inactive_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &50_i128, &5_000_i128);
+
+        client.stop_stream(&stream_id);
+    }
+
+    #[test]
+    #[should_panic(expected = "stream not found")]
+    fn test_stop_stream_missing_id_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        client.stop_stream(&999_u32);
+    }
+
+    #[test]
+    fn test_stop_stream_requires_payer_auth() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &50_i128, &5_000_i128);
+        client.start_stream(&stream_id);
+
+        env.set_auths(&[]);
+
+        let result = catch_unwind(AssertUnwindSafe(|| client.stop_stream(&stream_id)));
+        assert!(result.is_err());
+
+        let info = client.get_stream_info(&stream_id);
+        assert!(info.is_active);
+        assert_eq!(info.end_time, 0);
+    }
+
+    #[test]
     fn test_settle_returns_amount() {
         let env = Env::default();
         env.mock_all_auths();
