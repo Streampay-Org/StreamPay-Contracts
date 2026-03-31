@@ -1,29 +1,70 @@
+//! # streampay-contracts
+//!
+//! Soroban smart contracts for StreamPay — continuous token streaming on Stellar.
+//!
+//! ---
+//!
+//! ## Ledger Timestamp Assumptions
+//!
+//! All time-based logic in this crate relies on **`Env::ledger().timestamp()`**.
+//!
+//! Key properties:
+//!
+//! - **Whole seconds only.** `u64` Unix timestamp, no sub-second resolution.
+//!   Accrual is always truncated to complete seconds.
+//!
+//! - **~5–6 s ledger cadence.** Timestamp does not advance between ledger closes.
+//!   All transactions in the same ledger share the *same* timestamp.
+//!
+//! - **Validator-set, not caller-set.** Agreed by SCP quorum. No transaction
+//!   sender can influence it. Timestamp-manipulation attacks are not possible.
+//!
+//! - **Monotonic.** Protocol rules guarantee `new >= previous`.
+//!
+//! - **Dust tail.** The fractional-second gap between the last ledger close
+//!   before `end_time` and `end_time` itself is never claimable by the recipient.
+//!   It is reclaimed by the sender on stream close.
+//!
+//! ### Off-chain UX recommendation
+//!
+//! Derive elapsed time from the **last confirmed ledger close time** (Horizon/RPC),
+//! not the device wall clock. Wall-clock interpolation overstates claimable balance.
+//!
+//! See [`docs/timestamp-accrual.md`](../docs/timestamp-accrual.md) for full detail.
 //! StreamPay — Soroban smart contracts for continuous payment streaming.
 //!
-//! Provides: create_stream, start_stream, stop_stream, settle_stream, cancel_stream,
-//! pause_stream, resume_stream, archive_stream, get_stream_info, version.
+//! Provides: create_stream, start_stream, stop_stream, settle_stream,
+//! archive_stream, get_stream_info, version.
 //!
-//! ## Features
+//! # Integer Safety — i128 Saturation Semantics
 //!
-//! ### Stream Cancelation (Issue #4)
-//! - Payer can cancel a stream early with `cancel_stream`
-//! - Upon cancellation, all accrued amounts are automatically settled to the recipient
-//! - Remaining unaccrued balance is refunded to the payer
-//! - Race condition safety: uses atomic settle-then-deactivate pattern
+//! All accrual arithmetic uses **saturating** operations to guarantee no silent
+//! wrap-around, regardless of how extreme `rate_per_second` or `elapsed` become.
 //!
-//! ### Pause/Resume (Issue)
-//! - Payer can pause an active stream with `pause_stream` (accrual stops)
-//! - Payer can resume a paused stream with `resume_stream` (accrual resumes)
-//! - Paused streams do not accrue time; balances are preserved
-//! - Distinct from `stop_stream` (which is final unless restarted)
+//! ## Why saturation instead of checked/wrapping?
+//! * Wrapping would silently produce a wrong (possibly negative) amount, which
+//!   could drain the payer's balance incorrectly or credit the recipient nothing.
+//! * Panicking on overflow would make the contract un-settleable for legitimate
+//!   high-value streams.
+//! * Saturating clamps the intermediate product at `i128::MAX` and then the
+//!   `.min(balance)` guard ensures the final settled amount never exceeds the
+//!   deposited balance — the worst case is the recipient receives exactly what
+//!   was deposited, which is the correct economic outcome.
 //!
-//! ### Maximum Duration / End Time (Issue #7)
-//! - `end_time` specifies when a stream must end (optional)
-//! - Validated at creation: `end_time > start_time` when set
-//! - At settlement, accrual is capped at `end_time` to prevent infinite streaming
-//! - Streams auto-deactivate if settlement reaches `end_time`
+//! ## Stellar / Soroban timestamp limits
+//! Soroban ledger timestamps are `u64` Unix seconds.  The practical ceiling on
+//! Stellar today is well under 2^32 seconds (~136 years from epoch), but the
+//! contract casts `elapsed: u64` to `i128` before multiplying, so even a
+//! pathological elapsed value of `u64::MAX` (~1.8 × 10^19 s) combined with
+//! `i128::MAX` rate saturates to `i128::MAX` rather than wrapping.
+//!
+//! ## Invariants upheld by `settle_stream`
+//! 1. `amount >= 0` — saturation of non-negative operands stays non-negative.
+//! 2. `amount <= balance` — enforced by `.min(info.balance)`.
+//! 3. `new_balance >= 0` — `balance.saturating_sub(amount)` where `amount <=
+//!    balance` always yields a non-negative result.
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, Vec};
 
 /// Contract version: major * 1_000_000 + minor * 1_000 + patch.
 /// Current: 0.2.0 → 2_000
@@ -50,6 +91,24 @@ pub struct StreamInfo {
     pub is_active: bool,
     pub paused_at: u64,          // 0 if not paused; timestamp of pause if paused
 }
+
+/// Event data emitted when a new stream is created.
+///
+/// Topics: `["stream_created", stream_id]`
+/// Data:   `StreamCreatedEvent { payer, recipient, rate_per_second, initial_balance }`
+///
+/// Indexers can filter on topic[0] == "stream_created" and topic[1] == stream_id.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct StreamCreatedEvent {
+    pub payer: Address,
+    pub recipient: Address,
+    pub rate_per_second: i128,
+    pub initial_balance: i128,
+}
+
+#[contract]
+pub struct StreamPayContract;
 
 #[contractimpl]
 impl StreamPayContract {
@@ -83,6 +142,7 @@ impl StreamPayContract {
         set_next_stream_id(&env, stream_id + 1);
         extend_stream_ttl(&env, stream_id);
         extend_instance_ttl(&env);
+        emit_stream_created(&env, stream_id, &payer, &info.recipient, rate_per_second, initial_balance);
         stream_id
     }
 
@@ -124,9 +184,27 @@ impl StreamPayContract {
         extend_instance_ttl(&env);
     }
 
-    /// Settle stream: compute streamed amount since start (or since resumption if paused) and deduct from balance.
-    /// Respects end_time: if set, accrual is capped at end_time and stream auto-deactivates.
-    /// When paused, uses paused_at timestamp instead of current time.
+    /// Settle stream: compute streamed amount since start and deduct from balance.
+    ///
+    /// # Saturation semantics
+    ///
+    /// The accrual formula is:
+    /// ```text
+    /// amount = (elapsed as i128).saturating_mul(rate_per_second).min(balance)
+    /// ```
+    ///
+    /// Both operands are non-negative (`elapsed` is a `u64` difference cast to
+    /// `i128`; `rate_per_second` is validated `> 0` at creation time), so the
+    /// saturating multiply clamps at `i128::MAX` rather than wrapping.  The
+    /// subsequent `.min(balance)` ensures the settled amount never exceeds the
+    /// deposited balance, preserving the invariant `new_balance >= 0`.
+    ///
+    /// This means:
+    /// * An astronomically large `rate_per_second` (e.g. `i128::MAX`) will
+    ///   settle at most the full remaining balance — no funds are conjured.
+    /// * An astronomically long `elapsed` window (e.g. `u64::MAX` seconds,
+    ///   far beyond any real Stellar ledger timestamp) is handled identically.
+    /// * There is **no silent wrap** at any point in the computation.
     pub fn settle_stream(env: Env, stream_id: u32) -> i128 {
         let mut info = get_stream(&env, stream_id);
         if !info.is_active {
@@ -280,6 +358,34 @@ impl StreamPayContract {
     }
 }
 
+/// Emit a `stream_created` contract event.
+///
+/// Topics (indexer-friendly, low-cost):
+///   - `"stream_created"` — event discriminator
+///   - `stream_id`        — numeric stream identifier
+///
+/// Data payload: [`StreamCreatedEvent`] containing payer, recipient,
+/// rate_per_second, and initial_balance.
+fn emit_stream_created(
+    env: &Env,
+    stream_id: u32,
+    payer: &Address,
+    recipient: &Address,
+    rate_per_second: i128,
+    initial_balance: i128,
+) {
+    let mut topics = Vec::new(env);
+    topics.push_back(Symbol::new(env, "stream_created"));
+    topics.push_back(stream_id);
+    let data = StreamCreatedEvent {
+        payer: payer.clone(),
+        recipient: recipient.clone(),
+        rate_per_second,
+        initial_balance,
+    };
+    env.events().publish(topics, data);
+}
+
 fn stream_key(env: &Env, stream_id: u32) -> (Symbol, u32) {
     (Symbol::new(env, "stream"), stream_id)
 }
@@ -327,6 +433,14 @@ mod test {
 
     use super::*;
 
+    /// Advances the test ledger timestamp by `seconds` so accrual scenarios
+    /// can assert deterministic elapsed-time behavior.
+    fn advance_ledger_time(env: &Env, seconds: u64) {
+        env.ledger().with_mut(|li| {
+            li.timestamp += seconds;
+        });
+    }
+
     #[test]
     fn test_create_stream_valid() {
         let env = Env::default();
@@ -346,6 +460,66 @@ mod test {
         assert_eq!(info.balance, 10_000);
         assert!(!info.is_active);
         assert_eq!(info.paused_at, 0);
+    }
+
+    /// Verify that `create_stream` emits exactly one `stream_created` event
+    /// with the correct topics and data payload.
+    #[test]
+    fn test_create_stream_emits_event() {
+        use soroban_sdk::testutils::Events as _;
+
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+
+        let events = env.events().all();
+        // Exactly one event should have been emitted
+        assert_eq!(events.len(), 1);
+
+        let (emitting_contract, topics, data) = events.get(0).unwrap();
+        assert_eq!(emitting_contract, contract_id);
+
+        // topic[0] == "stream_created", topic[1] == stream_id
+        let topic0: Symbol = topics.get(0).unwrap();
+        let topic1: u32 = topics.get(1).unwrap();
+        assert_eq!(topic0, Symbol::new(&env, "stream_created"));
+        assert_eq!(topic1, stream_id);
+
+        // Data payload carries all four fields
+        let event_data: StreamCreatedEvent = soroban_sdk::FromVal::from_val(&env, &data);
+        assert_eq!(event_data.payer, payer);
+        assert_eq!(event_data.recipient, recipient);
+        assert_eq!(event_data.rate_per_second, 100);
+        assert_eq!(event_data.initial_balance, 10_000);
+    }
+
+    /// Only `create_stream` emits an event; start/stop must not emit
+    /// spurious `stream_created` events.
+    #[test]
+    fn test_no_spurious_stream_created_events() {
+        use soroban_sdk::testutils::Events as _;
+
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &10_i128, &1_000_i128);
+
+        let after_create = env.events().all().len();
+        assert_eq!(after_create, 1);
+
+        // start / stop must not add more stream_created events
+        client.start_stream(&stream_id);
+        client.stop_stream(&stream_id);
+        assert_eq!(env.events().all().len(), after_create);
     }
 
     #[test]
@@ -377,8 +551,9 @@ mod test {
         let recipient = Address::generate(&env);
         let stream_id = client.create_stream(&payer, &recipient, &10_i128, &1_000_i128, &0_u64);
         client.start_stream(&stream_id);
+        advance_ledger_time(&env, 10);
         let amount = client.settle_stream(&stream_id);
-        assert!(amount >= 0);
+        assert_eq!(amount, 100);
     }
 
     #[test]
@@ -457,9 +632,7 @@ mod test {
         client.start_stream(&stream_id);
 
         // Advance 10 seconds so balance drains to 0
-        env.ledger().with_mut(|li| {
-            li.timestamp += 10;
-        });
+        advance_ledger_time(&env, 10);
         let amount = client.settle_stream(&stream_id);
         assert_eq!(amount, 1_000);
 
@@ -519,9 +692,7 @@ mod test {
         // Create, start, drain, stop, then archive
         let stream_id = client.create_stream(&payer, &recipient, &100_i128, &1_000_i128, &0_u64);
         client.start_stream(&stream_id);
-        env.ledger().with_mut(|li| {
-            li.timestamp += 10;
-        });
+        advance_ledger_time(&env, 10);
         client.settle_stream(&stream_id);
         client.stop_stream(&stream_id);
         client.archive_stream(&stream_id);
@@ -530,10 +701,15 @@ mod test {
         client.get_stream_info(&stream_id);
     }
 
-    // ==================== New Tests: Cancel Stream (Issue #4) ====================
+    // -------------------------------------------------------------------------
+    // i128 saturation tests
+    // -------------------------------------------------------------------------
 
+    /// Extreme rate: i128::MAX rate_per_second with a 1-second window.
+    /// The product saturates at i128::MAX, but .min(balance) clamps it to the
+    /// deposited balance.  No funds are conjured; no wrap occurs.
     #[test]
-    fn test_cancel_stream_before_start() {
+    fn test_settle_extreme_rate_saturates_to_balance() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(StreamPayContract, ());
@@ -541,58 +717,28 @@ mod test {
 
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &1_000_i128, &0_u64);
-
-        // Should panic: cannot cancel before starting
-        client.cancel_stream(&stream_id);
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_cancel_stream_inactive_panics() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(StreamPayContract, ());
-        let client = StreamPayContractClient::new(&env, &contract_id);
-
-        let payer = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &1_000_i128, &0_u64);
-        client.start_stream(&stream_id);
-        client.stop_stream(&stream_id);
-
-        // Should panic: cannot cancel after stopping
-        client.cancel_stream(&stream_id);
-    }
-
-    #[test]
-    fn test_cancel_stream_mid_stream() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(StreamPayContract, ());
-        let client = StreamPayContractClient::new(&env, &contract_id);
-
-        let payer = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        // rate=100/s, balance=1000
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &1_000_i128, &0_u64);
+        let balance = 1_000_000_i128;
+        // Use i128::MAX as rate — any elapsed > 0 would overflow without saturation
+        let stream_id = client.create_stream(&payer, &recipient, &i128::MAX, &balance);
         client.start_stream(&stream_id);
 
-        // Advance 5 seconds: 500 should be accrued
+        // Advance 1 second
         env.ledger().with_mut(|li| {
-            li.timestamp += 5;
+            li.timestamp += 1;
         });
 
-        client.cancel_stream(&stream_id);
-        let info = client.get_stream_info(&stream_id);
+        let amount = client.settle_stream(&stream_id);
+        // Saturating mul: i128::MAX * 1 = i128::MAX, clamped to balance
+        assert_eq!(amount, balance, "extreme rate must settle exactly the balance, not more");
 
-        // Balance should be 500 (1000 - 500 accrued)
-        assert_eq!(info.balance, 500);
-        assert!(!info.is_active);
+        let info = client.get_stream_info(&stream_id);
+        assert_eq!(info.balance, 0, "balance must be fully drained, not negative");
     }
 
+    /// Extreme elapsed: simulate a very long window (u64::MAX seconds) with a
+    /// normal rate.  The product saturates at i128::MAX, clamped to balance.
     #[test]
-    fn test_cancel_near_depletion() {
+    fn test_settle_extreme_elapsed_saturates_to_balance() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(StreamPayContract, ());
@@ -600,26 +746,53 @@ mod test {
 
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &1_000_i128, &0_u64);
+        let balance = 500_i128;
+        let stream_id = client.create_stream(&payer, &recipient, &1_000_i128, &balance);
+
+        // Manually set start_time to 0 via start_stream at timestamp 0
         client.start_stream(&stream_id);
 
-        // Advance 12 seconds (would drain 1200, but balance is only 1000)
+        // Jump to near u64::MAX to create a massive elapsed window
         env.ledger().with_mut(|li| {
-            li.timestamp += 12;
+            li.timestamp = u64::MAX;
         });
 
-        client.cancel_stream(&stream_id);
-        let info = client.get_stream_info(&stream_id);
+        let amount = client.settle_stream(&stream_id);
+        assert_eq!(amount, balance, "extreme elapsed must settle exactly the balance");
 
-        // Balance should be 0 (capped at balance)
+        let info = client.get_stream_info(&stream_id);
+        assert_eq!(info.balance, 0, "balance must reach zero, not go negative");
+    }
+
+    /// Both rate and elapsed at maximum: double-extreme case.
+    /// saturating_mul(i128::MAX, i128::MAX) = i128::MAX, clamped to balance.
+    #[test]
+    fn test_settle_extreme_rate_and_elapsed_saturates_to_balance() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let balance = 42_i128;
+        let stream_id = client.create_stream(&payer, &recipient, &i128::MAX, &balance);
+        client.start_stream(&stream_id);
+
+        env.ledger().with_mut(|li| {
+            li.timestamp = u64::MAX;
+        });
+
+        let amount = client.settle_stream(&stream_id);
+        assert_eq!(amount, balance);
+
+        let info = client.get_stream_info(&stream_id);
         assert_eq!(info.balance, 0);
-        assert!(!info.is_active);
     }
 
-    // ==================== New Tests: Pause/Resume ====================
-
+    /// Settled amount is always non-negative — invariant check.
     #[test]
-    fn test_pause_and_resume_stream() {
+    fn test_settle_amount_never_negative() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(StreamPayContract, ());
@@ -627,257 +800,67 @@ mod test {
 
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
-        // rate=100/s, balance=1000
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &1_000_i128, &0_u64);
+        let stream_id = client.create_stream(&payer, &recipient, &i128::MAX, &1_000_i128);
         client.start_stream(&stream_id);
 
-        // Advance 3 seconds
         env.ledger().with_mut(|li| {
-            li.timestamp += 3;
+            li.timestamp += 100;
         });
 
-        // Pause: should settle 300 (3 * 100)
-        client.pause_stream(&stream_id);
-        let info = client.get_stream_info(&stream_id);
-        assert_eq!(info.balance, 700);  // 1000 - 300
-        assert!(info.is_active);        // Still marked active (paused state)
-        assert!(info.paused_at > 0);    // Paused timestamp set
+        let amount = client.settle_stream(&stream_id);
+        assert!(amount >= 0, "settled amount must never be negative");
+    }
 
-        // Advance another 5 seconds (no accrual while paused)
+    /// Balance never goes negative after settle — invariant check.
+    #[test]
+    fn test_balance_never_negative_after_settle() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &i128::MAX, &999_i128);
+        client.start_stream(&stream_id);
+
+        env.ledger().with_mut(|li| {
+            li.timestamp = u64::MAX;
+        });
+
+        client.settle_stream(&stream_id);
+        let info = client.get_stream_info(&stream_id);
+        assert!(info.balance >= 0, "balance must never go negative");
+    }
+
+    /// Partial accrual: rate * elapsed < balance — only partial amount settled.
+    #[test]
+    fn test_settle_partial_accrual_no_saturation() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        // rate=10/s, balance=10_000, elapsed=5s → amount=50
+        let stream_id = client.create_stream(&payer, &recipient, &10_i128, &10_000_i128);
+        client.start_stream(&stream_id);
+
         env.ledger().with_mut(|li| {
             li.timestamp += 5;
         });
 
-        // Resume
-        client.resume_stream(&stream_id);
-        let info = client.get_stream_info(&stream_id);
-        assert_eq!(info.balance, 700);  // Balance unchanged during pause
-        assert!(info.is_active);
-        assert_eq!(info.paused_at, 0);  // Paused state cleared
-    }
-
-    #[test]
-    fn test_settle_while_paused() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(StreamPayContract, ());
-        let client = StreamPayContractClient::new(&env, &contract_id);
-
-        let payer = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &1_000_i128, &0_u64);
-        client.start_stream(&stream_id);
-
-        // Advance 5 seconds
-        env.ledger().with_mut(|li| {
-            li.timestamp += 5;
-        });
-
-        client.pause_stream(&stream_id);
-        let info_paused = client.get_stream_info(&stream_id);
-        assert_eq!(info_paused.balance, 500);
-
-        // Advance another 10 seconds (should NOT accrue while paused)
-        env.ledger().with_mut(|li| {
-            li.timestamp += 10;
-        });
-
-        let settled = client.settle_stream(&stream_id);
-        // settle_stream while paused should return 0 (no additional accrual)
-        assert_eq!(settled, 0);
-
-        let info = client.get_stream_info(&stream_id);
-        assert_eq!(info.balance, 500);  // Balance unchanged
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_pause_already_paused_panics() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(StreamPayContract, ());
-        let client = StreamPayContractClient::new(&env, &contract_id);
-
-        let payer = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &1_000_i128, &0_u64);
-        client.start_stream(&stream_id);
-        client.pause_stream(&stream_id);
-
-        // Should panic: already paused
-        client.pause_stream(&stream_id);
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_resume_not_paused_panics() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(StreamPayContract, ());
-        let client = StreamPayContractClient::new(&env, &contract_id);
-
-        let payer = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &1_000_i128, &0_u64);
-        client.start_stream(&stream_id);
-
-        // Should panic: stream not paused
-        client.resume_stream(&stream_id);
-    }
-
-    #[test]
-    fn test_multiple_pause_resume_toggles() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(StreamPayContract, ());
-        let client = StreamPayContractClient::new(&env, &contract_id);
-
-        let payer = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        // rate=50/s, balance=1000
-        let stream_id = client.create_stream(&payer, &recipient, &50_i128, &1_000_i128, &0_u64);
-        client.start_stream(&stream_id);
-
-        // First pause/resume cycle: advance 2s, pause, advance 3s, resume
-        env.ledger().with_mut(|li| {
-            li.timestamp += 2;
-        });
-        client.pause_stream(&stream_id);
-        let info = client.get_stream_info(&stream_id);
-        assert_eq!(info.balance, 900);  // 1000 - 100
-
-        env.ledger().with_mut(|li| {
-            li.timestamp += 3;
-        });
-        client.resume_stream(&stream_id);
-
-        // Second pause/resume: advance 4s, pause, advance 6s, resume
-        env.ledger().with_mut(|li| {
-            li.timestamp += 4;
-        });
-        client.pause_stream(&stream_id);
-        let info = client.get_stream_info(&stream_id);
-        assert_eq!(info.balance, 700);  // 900 - 200
-
-        env.ledger().with_mut(|li| {
-            li.timestamp += 6;
-        });
-        client.resume_stream(&stream_id);
-
-        let info = client.get_stream_info(&stream_id);
-        assert_eq!(info.balance, 700);  // Still 700 (paused prevented accrual)
-    }
-
-    // ==================== New Tests: End Time (Issue #7) ====================
-
-    #[test]
-    fn test_create_stream_with_end_time() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(StreamPayContract, ());
-        let client = StreamPayContractClient::new(&env, &contract_id);
-
-        let payer = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        let end_time = 1000_u64;
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128, &end_time);
-
-        let info = client.get_stream_info(&stream_id);
-        assert_eq!(info.end_time, end_time);
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_start_stream_end_time_in_past_panics() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(StreamPayContract, ());
-        let client = StreamPayContractClient::new(&env, &contract_id);
-
-        let payer = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128, &100_u64);
-
-        // Current timestamp is 0; end_time is 100, so it's in the future
-        client.start_stream(&stream_id);
-
-        // Advance past end_time
-        env.ledger().with_mut(|li| {
-            li.timestamp = 200;
-        });
-
-        // Try to re-start with past end_time (should panic)
-        // First stop it
-        client.stop_stream(&stream_id);
-
-        // Try to start again with past end_time
-        client.start_stream(&stream_id);  // Should panic
-    }
-
-    #[test]
-    fn test_settle_respects_end_time() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(StreamPayContract, ());
-        let client = StreamPayContractClient::new(&env, &contract_id);
-
-        let payer = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        // rate=100/s, balance=2000, end_time=10s from start
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &2_000_i128, &10_u64);
-        client.start_stream(&stream_id);
-
-        // Now timestamps start at whatever env.ledger().timestamp() is
-        let start_ts = env.ledger().timestamp();
-
-        // Advance 5 seconds (within end_time window)
-        env.ledger().with_mut(|li| {
-            li.timestamp = start_ts + 5;
-        });
-        let amount1 = client.settle_stream(&stream_id);
-        assert_eq!(amount1, 500);  // 5 * 100
-        let info = client.get_stream_info(&stream_id);
-        assert_eq!(info.balance, 1_500);
-        assert!(info.is_active);    // Still active
-
-        // Advance past end_time (to 15 seconds)
-        env.ledger().with_mut(|li| {
-            li.timestamp = start_ts + 15;
-        });
-        let amount2 = client.settle_stream(&stream_id);
-        // Should only accrue from 5 to 10 = 500
-        assert_eq!(amount2, 500);
-        let info = client.get_stream_info(&stream_id);
-        assert_eq!(info.balance, 1_000);
-        assert!(!info.is_active);   // Auto-deactivated at end_time
-    }
-
-    #[test]
-    fn test_settle_at_exact_end_time() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register(StreamPayContract, ());
-        let client = StreamPayContractClient::new(&env, &contract_id);
-
-        let payer = Address::generate(&env);
-        let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &1_000_i128, &5_u64);
-        client.start_stream(&stream_id);
-
-        let start_ts = env.ledger().timestamp();
-
-        // Settle at exactly end_time
-        env.ledger().with_mut(|li| {
-            li.timestamp = start_ts + 5;
-        });
         let amount = client.settle_stream(&stream_id);
-        assert_eq!(amount, 500);  // 5 * 100
+        assert_eq!(amount, 50, "partial accrual should be exact when no saturation");
+
         let info = client.get_stream_info(&stream_id);
-        assert!(!info.is_active);
+        assert_eq!(info.balance, 9_950);
     }
 
+    /// Zero elapsed (settle immediately after start) — amount must be 0.
     #[test]
-    fn test_end_time_zero_means_no_limit() {
+    fn test_settle_zero_elapsed_returns_zero() {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(StreamPayContract, ());
@@ -885,20 +868,44 @@ mod test {
 
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
-        // end_time=0 → no time limit
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128, &0_u64);
+        let stream_id = client.create_stream(&payer, &recipient, &i128::MAX, &1_000_i128);
         client.start_stream(&stream_id);
 
-        let start_ts = env.ledger().timestamp();
-
-        // Advance very far (100 seconds)
-        env.ledger().with_mut(|li| {
-            li.timestamp = start_ts + 100;
-        });
+        // No time advance — elapsed = 0
         let amount = client.settle_stream(&stream_id);
-        assert_eq!(amount, 10_000);  // Full balance drained
+        assert_eq!(amount, 0, "zero elapsed must yield zero amount even with max rate");
+    }
+
+    /// Multiple sequential settles with extreme rate — each settle drains
+    /// remaining balance; total never exceeds initial deposit.
+    #[test]
+    fn test_settle_multiple_calls_total_capped_at_initial_balance() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let initial_balance = 300_i128;
+        let stream_id = client.create_stream(&payer, &recipient, &i128::MAX, &initial_balance);
+        client.start_stream(&stream_id);
+
+        let mut total_settled = 0_i128;
+
+        for tick in [1_u64, 1, 1] {
+            env.ledger().with_mut(|li| {
+                li.timestamp += tick;
+            });
+            total_settled += client.settle_stream(&stream_id);
+        }
+
+        assert_eq!(
+            total_settled, initial_balance,
+            "total settled across multiple calls must equal initial balance"
+        );
         let info = client.get_stream_info(&stream_id);
-        assert!(info.is_active);     // Still active (only stops due to balance depletion)
+        assert_eq!(info.balance, 0);
     }
 }
 

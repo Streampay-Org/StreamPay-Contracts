@@ -111,3 +111,12 @@ streampay-contracts/
 ## License
 
 MIT
+
+## Documentation
+
+| Doc | Description |
+|---|---|
+| [`docs/timestamp-accrual.md`](docs/timestamp-accrual.md) | Ledger timestamp assumptions: validator behavior, coarse granularity, accrual edge cases, off-chain UX rounding |
+| [`SECURITY.md`](SECURITY.md) | Security policy and responsible disclosure |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contribution guidelines |
+| [`CHANGELOG.md`](CHANGELOG.md) | Release history |
