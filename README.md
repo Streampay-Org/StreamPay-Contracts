@@ -42,6 +42,60 @@ When releasing, update **both** `Cargo.toml` `version` and the `VERSION` const i
 - [Rust](https://rustup.rs/) (stable, with `rustfmt`)
 - Optional: [Stellar CLI](https://developers.stellar.org/docs/tools/stellar-cli) for deployment
 
+Note: this crate uses `soroban-sdk` version 22.0 (see `Cargo.toml`).
+
+Building, testing and deploying (copy-paste)
+-----------------------------------------
+
+1) Build optimized WASM (recommended via Docker builder included):
+
+```bash
+# Build with local toolchain (WASM output in target/)
+cargo build --release --target wasm32-unknown-unknown
+
+# OR use deterministic Docker builder (produces streampay_contracts.wasm)
+docker build -f docker/Dockerfile.build -t streampay-wasm .
+docker run --rm -v "$(pwd)":/work streampay-wasm
+```
+
+2) Run unit tests locally:
+
+```bash
+cargo test
+```
+
+3) Deploy to Futurenet/Testnet using `soroban` CLI (example):
+
+```bash
+# install soroban CLI if not installed
+curl -sSf https://soroban.stellar.org/install.sh | bash
+
+# set the network (futurenet/testnet)
+soroban config set network futurenet
+
+# upload contract and get contract id (example paths)
+soroban contract publish --wasm target/wasm32-unknown-unknown/release/streampay_contracts.wasm
+
+# note the contract id printed by the publish command
+```
+
+4) Example invocation (replace `<CONTRACT_ID>` and addresses):
+
+```bash
+# create_stream(payer, recipient, rate_per_second, initial_balance)
+soroban contract invoke --wasm target/wasm32-unknown-unknown/release/streampay_contracts.wasm \
+   --id <CONTRACT_ID> --fn create_stream --args <PAYER_ADDRESS> <RECIPIENT_ADDRESS> 100 10000
+
+# start_stream(stream_id)
+soroban contract invoke --id <CONTRACT_ID> --fn start_stream --args 1
+```
+
+Notes
+-----
+- The exact `soroban` CLI flags depend on the CLI version; consult `soroban --help`.
+- For deterministic WASM builds in CI, use the provided `docker/Dockerfile.build` which pins the Rust toolchain.
+- Ensure the `soroban-sdk` version in `Cargo.toml` is compatible with your `soroban` CLI and network.
+
 ## Setup for contributors
 
 1. **Clone and enter the repo**
