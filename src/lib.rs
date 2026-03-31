@@ -79,6 +79,14 @@ const INSTANCE_TTL_THRESHOLD: u32 = 17_280;
 /// Instance storage TTL extend-to (~30 days).
 const INSTANCE_TTL_EXTEND: u32 = 518_400;
 
+/// Minimum allowed rate per second to avoid uneconomical streams (anti-dust).
+/// Adjust this constant per deployment if desired.
+const MIN_RATE_PER_SECOND: i128 = 1;
+
+/// Minimum allowed initial balance when creating a stream.
+/// Adjust this constant per deployment if desired.
+const MIN_INITIAL_BALANCE: i128 = 1;
+
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct StreamInfo {
@@ -126,6 +134,13 @@ impl StreamPayContract {
         payer.require_auth();
         if rate_per_second <= 0 || initial_balance <= 0 {
             panic!("rate and balance must be positive");
+        }
+        // Enforce anti-dust minima
+        if rate_per_second < MIN_RATE_PER_SECOND {
+            panic!("rate_per_second below minimum allowed");
+        }
+        if initial_balance < MIN_INITIAL_BALANCE {
+            panic!("initial_balance below minimum allowed");
         }
         let stream_id = get_next_stream_id(&env);
         let info = StreamInfo {
@@ -520,6 +535,47 @@ mod test {
         client.start_stream(&stream_id);
         client.stop_stream(&stream_id);
         assert_eq!(env.events().all().len(), after_create);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_create_stream_below_min_rate_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        // rate below MIN_RATE_PER_SECOND should panic
+        client.create_stream(&payer, &recipient, &(MIN_RATE_PER_SECOND - 1), &10_000_i128);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_create_stream_below_min_initial_balance_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        // initial balance below MIN_INITIAL_BALANCE should panic
+        client.create_stream(&payer, &recipient, &100_i128, &(MIN_INITIAL_BALANCE - 1));
+    }
+
+    #[test]
+    fn test_create_stream_at_minimum_values_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &MIN_RATE_PER_SECOND, &MIN_INITIAL_BALANCE);
+        assert_eq!(stream_id, 1);
     }
 
     #[test]
