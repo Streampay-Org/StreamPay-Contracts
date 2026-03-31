@@ -67,8 +67,8 @@
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, Vec};
 
 /// Contract version: major * 1_000_000 + minor * 1_000 + patch.
-/// Current: 0.1.0 → 1_000
-const VERSION: u32 = 1_000;
+/// Current: 0.2.0 → 2_000
+const VERSION: u32 = 2_000;
 
 /// TTL threshold: extend when remaining TTL drops below ~1 day (17_280 ledgers at ~5s each).
 const STREAM_TTL_THRESHOLD: u32 = 17_280;
@@ -87,8 +87,9 @@ pub struct StreamInfo {
     pub rate_per_second: i128,
     pub balance: i128,
     pub start_time: u64,
-    pub end_time: u64,
+    pub end_time: u64,           // Max duration: stream auto-deactivates at this time
     pub is_active: bool,
+    pub paused_at: u64,          // 0 if not paused; timestamp of pause if paused
 }
 
 /// Event data emitted when a new stream is created.
@@ -111,13 +112,16 @@ pub struct StreamPayContract;
 
 #[contractimpl]
 impl StreamPayContract {
-    /// Create a new payment stream (payer, recipient, rate per second).
+    /// Create a new payment stream (payer, recipient, rate per second, optional end_time).
+    /// If end_time is 0, stream has no time limit (must be stopped manually).
+    /// If end_time > 0, must satisfy end_time > implicit start time (enforced at start_stream).
     pub fn create_stream(
         env: Env,
         payer: Address,
         recipient: Address,
         rate_per_second: i128,
         initial_balance: i128,
+        end_time: u64,  // 0 = no limit; otherwise must be > start_time (validated at start)
     ) -> u32 {
         payer.require_auth();
         if rate_per_second <= 0 || initial_balance <= 0 {
@@ -130,8 +134,9 @@ impl StreamPayContract {
             rate_per_second,
             balance: initial_balance,
             start_time: 0,
-            end_time: 0,
+            end_time,
             is_active: false,
+            paused_at: 0,
         };
         set_stream(&env, stream_id, &info);
         set_next_stream_id(&env, stream_id + 1);
@@ -142,14 +147,23 @@ impl StreamPayContract {
     }
 
     /// Start an existing stream.
+    /// If end_time was set at creation, validates that end_time > current timestamp.
     pub fn start_stream(env: Env, stream_id: u32) {
         let mut info = get_stream(&env, stream_id);
         info.payer.require_auth();
         if info.is_active {
             panic!("stream already active");
         }
+        let now = env.ledger().timestamp();
+        
+        // Validate end_time constraint if set
+        if info.end_time > 0 && info.end_time <= now {
+            panic!("end_time must be in the future");
+        }
+        
         info.is_active = true;
-        info.start_time = env.ledger().timestamp();
+        info.start_time = now;
+        info.paused_at = 0;  // Clear paused state
         set_stream(&env, stream_id, &info);
         extend_stream_ttl(&env, stream_id);
         extend_instance_ttl(&env);
@@ -164,6 +178,7 @@ impl StreamPayContract {
         }
         info.is_active = false;
         info.end_time = env.ledger().timestamp();
+        info.paused_at = 0;  // Clear paused state
         set_stream(&env, stream_id, &info);
         extend_stream_ttl(&env, stream_id);
         extend_instance_ttl(&env);
@@ -195,17 +210,125 @@ impl StreamPayContract {
         if !info.is_active {
             return 0;
         }
+        
         let now = env.ledger().timestamp();
-        let elapsed = now - info.start_time;
+        
+        // Determine settlement time: use paused_at if paused, else current time or end_time
+        let settlement_time = if info.paused_at > 0 {
+            // Paused: settle only up to pause point
+            info.paused_at
+        } else if info.end_time > 0 && now > info.end_time {
+            // Past end_time: cap accrual at end_time
+            info.end_time
+        } else {
+            // Normal case: use current time
+            now
+        };
+        
+        let elapsed = settlement_time - info.start_time;
         let amount = (elapsed as i128)
             .saturating_mul(info.rate_per_second)
             .min(info.balance);
         info.balance = info.balance.saturating_sub(amount);
-        info.start_time = now;
+        info.start_time = settlement_time;
+        
+        // Auto-deactivate if end_time reached
+        if info.end_time > 0 && settlement_time >= info.end_time {
+            info.is_active = false;
+            info.end_time = settlement_time;
+        }
+        
         set_stream(&env, stream_id, &info);
         extend_stream_ttl(&env, stream_id);
         extend_instance_ttl(&env);
         amount
+    }
+
+    /// Cancel a stream early (payer-only).
+    /// Immediately settles all accrued amounts to the recipient.
+    /// Remaining unaccrued balance is retained by the payer.
+    /// Atomic operation: prevents race conditions with settle.
+    pub fn cancel_stream(env: Env, stream_id: u32) {
+        let mut info = get_stream(&env, stream_id);
+        info.payer.require_auth();
+        
+        if !info.is_active {
+            panic!("cannot cancel inactive stream");
+        }
+        
+        let now = env.ledger().timestamp();
+        
+        // Settle accrued amount up to cancellation
+        let elapsed = now - info.start_time;
+        let accrued = (elapsed as i128)
+            .saturating_mul(info.rate_per_second)
+            .min(info.balance);
+        
+        // Deduct accrued from balance (paid to recipient)
+        info.balance = info.balance.saturating_sub(accrued);
+        info.is_active = false;
+        info.end_time = now;  // Mark cancellation point
+        
+        set_stream(&env, stream_id, &info);
+        extend_stream_ttl(&env, stream_id);
+        extend_instance_ttl(&env);
+    }
+
+    /// Pause an active stream (payer-only).
+    /// Stops accrual without full termination; preserves balance and schedule.
+    /// Can be resumed with resume_stream.
+    /// Distinct from stop_stream (which is final).
+    pub fn pause_stream(env: Env, stream_id: u32) {
+        let mut info = get_stream(&env, stream_id);
+        info.payer.require_auth();
+        
+        if !info.is_active {
+            panic!("cannot pause inactive stream");
+        }
+        if info.paused_at > 0 {
+            panic!("stream already paused");
+        }
+        
+        let now = env.ledger().timestamp();
+        
+        // Settle accrued amount up to pause point
+        let elapsed = now - info.start_time;
+        let accrued = (elapsed as i128)
+            .saturating_mul(info.rate_per_second)
+            .min(info.balance);
+        info.balance = info.balance.saturating_sub(accrued);
+        
+        // Mark paused but keep is_active true (logical "paused" state)
+        info.paused_at = now;
+        
+        set_stream(&env, stream_id, &info);
+        extend_stream_ttl(&env, stream_id);
+        extend_instance_ttl(&env);
+    }
+
+    /// Resume a paused stream (payer-only).
+    /// Restarts accrual from the pause point.
+    /// Is_active remains true; paused_at is cleared.
+    pub fn resume_stream(env: Env, stream_id: u32) {
+        let mut info = get_stream(&env, stream_id);
+        info.payer.require_auth();
+        
+        if !info.is_active {
+            panic!("cannot resume inactive stream");
+        }
+        if info.paused_at == 0 {
+            panic!("stream is not paused");
+        }
+        
+        let now = env.ledger().timestamp();
+        
+        // Resume: reset start_time to account for paused duration and clear paused state
+        info.start_time = now;
+        info.paused_at = 0;
+        
+        set_stream(&env, stream_id, &info);
+        extend_stream_ttl(&env, stream_id);
+        extend_instance_ttl(&env);
     }
 
     /// Get stream info (read-only).
@@ -327,7 +450,7 @@ mod test {
 
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128, &0_u64);
         assert_eq!(stream_id, 1);
 
         let info = client.get_stream_info(&stream_id);
@@ -336,6 +459,7 @@ mod test {
         assert_eq!(info.rate_per_second, 100);
         assert_eq!(info.balance, 10_000);
         assert!(!info.is_active);
+        assert_eq!(info.paused_at, 0);
     }
 
     /// Verify that `create_stream` emits exactly one `stream_created` event
@@ -407,7 +531,7 @@ mod test {
 
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &50_i128, &5_000_i128);
+        let stream_id = client.create_stream(&payer, &recipient, &50_i128, &5_000_i128, &0_u64);
         client.start_stream(&stream_id);
         let info = client.get_stream_info(&stream_id);
         assert!(info.is_active);
@@ -425,7 +549,7 @@ mod test {
 
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &10_i128, &1_000_i128);
+        let stream_id = client.create_stream(&payer, &recipient, &10_i128, &1_000_i128, &0_u64);
         client.start_stream(&stream_id);
         advance_ledger_time(&env, 10);
         let amount = client.settle_stream(&stream_id);
@@ -437,7 +561,7 @@ mod test {
         let env = Env::default();
         let contract_id = env.register(StreamPayContract, ());
         let client = StreamPayContractClient::new(&env, &contract_id);
-        assert_eq!(client.version(), 1_000);
+        assert_eq!(client.version(), 2_000);
     }
 
     #[test]
@@ -465,7 +589,7 @@ mod test {
 
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128, &0_u64);
 
         // Verify stream is retrievable (storage works)
         let info = client.get_stream_info(&stream_id);
@@ -481,7 +605,7 @@ mod test {
 
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128, &0_u64);
 
         // Advance ledger by a modest amount — stream should still be alive
         // because create_stream extended its TTL
@@ -504,7 +628,7 @@ mod test {
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
         // rate=100/s, balance=1000 → fully drained after 10s
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &1_000_i128);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &1_000_i128, &0_u64);
         client.start_stream(&stream_id);
 
         // Advance 10 seconds so balance drains to 0
@@ -531,7 +655,7 @@ mod test {
 
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128, &0_u64);
 
         // Stream is inactive but has balance > 0 — should panic
         // to protect recipient's entitlement
@@ -548,7 +672,7 @@ mod test {
 
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128, &0_u64);
         client.start_stream(&stream_id);
 
         // Should panic — stream is active
@@ -566,7 +690,7 @@ mod test {
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
         // Create, start, drain, stop, then archive
-        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &1_000_i128);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &1_000_i128, &0_u64);
         client.start_stream(&stream_id);
         advance_ledger_time(&env, 10);
         client.settle_stream(&stream_id);
@@ -784,3 +908,4 @@ mod test {
         assert_eq!(info.balance, 0);
     }
 }
+
