@@ -441,6 +441,17 @@ fn extend_instance_ttl(env: &Env) {
         .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND);
 }
 
+/// Shared accrual computation used by `settle_stream` and `accrued_amount`.
+fn compute_accrued_amount(info: &StreamInfo, now: u64) -> i128 {
+    if !info.is_active {
+        return 0;
+    }
+    let elapsed = now - info.start_time;
+    (elapsed as i128)
+        .saturating_mul(info.rate_per_second)
+        .min(info.balance)
+}
+
 #[cfg(test)]
 mod test {
     use soroban_sdk::testutils::Address as _;
