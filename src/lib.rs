@@ -396,6 +396,15 @@ fn extend_instance_ttl(env: &Env) {
         .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND);
 }
 
+fn compute_linear_vested(total_amount: i128, duration_seconds: u64, elapsed_seconds: u64) -> i128 {
+    let capped_elapsed = if elapsed_seconds > duration_seconds {
+        duration_seconds
+    } else {
+        elapsed_seconds
+    };
+    total_amount.saturating_mul(capped_elapsed as i128) / duration_seconds as i128
+}
+
 #[cfg(test)]
 mod test {
     use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -756,6 +765,119 @@ mod test {
         }
 
         client.batch_settle(&stream_ids);
+    }
+
+    #[test]
+    fn test_vesting_unlocks_linearly_across_multiple_settlements() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_vesting_stream(&payer, &recipient, &1_000_i128, &100_u64);
+        client.start_stream(&stream_id);
+
+        env.ledger().with_mut(|li| {
+            li.timestamp += 10;
+        });
+        let first = client.settle_stream(&stream_id);
+        assert_eq!(first, 100);
+
+        env.ledger().with_mut(|li| {
+            li.timestamp += 40;
+        });
+        let second = client.settle_stream(&stream_id);
+        assert_eq!(second, 400);
+
+        let info = client.get_stream_info(&stream_id);
+        assert_eq!(info.balance, 500);
+        if let StreamMode::LinearVesting { vested_amount, .. } = info.mode {
+            assert_eq!(vested_amount, 500);
+        } else {
+            panic!("expected linear vesting mode");
+        }
+    }
+
+    #[test]
+    fn test_vesting_releases_rounding_remainder_at_end() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_vesting_stream(&payer, &recipient, &1_000_i128, &3_u64);
+        client.start_stream(&stream_id);
+
+        env.ledger().with_mut(|li| {
+            li.timestamp += 1;
+        });
+        assert_eq!(client.settle_stream(&stream_id), 333);
+
+        env.ledger().with_mut(|li| {
+            li.timestamp += 1;
+        });
+        assert_eq!(client.settle_stream(&stream_id), 333);
+
+        env.ledger().with_mut(|li| {
+            li.timestamp += 1;
+        });
+        assert_eq!(client.settle_stream(&stream_id), 334);
+
+        let info = client.get_stream_info(&stream_id);
+        assert_eq!(info.balance, 0);
+    }
+
+    #[test]
+    fn test_vesting_schedule_anchor_persists_across_restart() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_vesting_stream(&payer, &recipient, &1_000_i128, &100_u64);
+        client.start_stream(&stream_id);
+
+        env.ledger().with_mut(|li| {
+            li.timestamp += 10;
+        });
+        client.stop_stream(&stream_id);
+
+        env.ledger().with_mut(|li| {
+            li.timestamp += 20;
+        });
+        client.start_stream(&stream_id);
+
+        // Vesting is anchored to the first start time, so 30% is now claimable.
+        let amount = client.settle_stream(&stream_id);
+        assert_eq!(amount, 300);
+    }
+
+    #[test]
+    fn test_vesting_unlocks_full_balance_after_duration() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_vesting_stream(&payer, &recipient, &1_000_i128, &10_u64);
+        client.start_stream(&stream_id);
+
+        env.ledger().with_mut(|li| {
+            li.timestamp += 15;
+        });
+        let amount = client.settle_stream(&stream_id);
+        assert_eq!(amount, 1_000);
+
+        let info = client.get_stream_info(&stream_id);
+        assert_eq!(info.balance, 0);
     }
 
     #[test]
