@@ -141,14 +141,45 @@ impl StreamPayContract {
 
 //! StreamPay — Soroban smart contracts for continuous payment streaming.
 //!
-//! Provides: create_stream, start_stream, stop_stream, settle_stream,
-//! archive_stream, get_stream_info, version.
+//! # Public entry points
+//!
+//! | Function           | Auth      | Description                                         |
+//! |--------------------|-----------|-----------------------------------------------------|
+//! | `create_stream`    | payer     | Escrow tokens and register a new stream             |
+//! | `start_stream`     | payer     | Begin accrual                                       |
+//! | `stop_stream`      | payer     | Pause accrual                                       |
+//! | `settle_stream`    | none      | Move accrued tokens to the claimable pool           |
+//! | `withdraw_stream`  | recipient | Transfer all claimable tokens on-ledger             |
+//! | `archive_stream`   | payer     | Remove a fully-settled, fully-withdrawn stream      |
+//! | `get_stream_info`  | none      | Read-only stream metadata                           |
+//! | `version`          | none      | Contract version constant                           |
+//!
+//! # Accounting invariant
+//!
+//! For every stream at every point in time:
+//!
+//! ```text
+//! balance + claimable_balance ≤ initial_deposit
+//! ```
+//!
+//! * `balance`           — tokens held in escrow, not yet earned by the recipient.
+//! * `claimable_balance` — tokens earned by the recipient, not yet transferred.
+//!
+//! `settle_stream` (permissionless) advances accounting:
+//! `balance -= accrued`, `claimable_balance += accrued`.
+//!
+//! `withdraw_stream` (recipient-auth) performs the actual on-ledger transfer
+//! of `claimable_balance` to the recipient and resets it to zero.
+//! It implicitly settles any outstanding accrual first.
+//!
+//! Calling `withdraw_stream` when nothing is claimable is safe and returns 0
+//! (idempotent — safe to call multiple times).
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Symbol};
 
 /// Contract version: major * 1_000_000 + minor * 1_000 + patch.
-/// Current: 0.1.0 → 1_000
-const VERSION: u32 = 1_000;
+/// Current: 0.2.0 → 2_000
+const VERSION: u32 = 2_000;
 
 /// TTL threshold: extend when remaining TTL drops below ~1 day (17_280 ledgers at ~5s each).
 const STREAM_TTL_THRESHOLD: u32 = 17_280;
@@ -159,14 +190,34 @@ const INSTANCE_TTL_THRESHOLD: u32 = 17_280;
 /// Instance storage TTL extend-to (~30 days).
 const INSTANCE_TTL_EXTEND: u32 = 518_400;
 
+/// All state associated with a payment stream.
+///
+/// # Balance accounting
+///
+/// `balance` and `claimable_balance` together track all escrowed funds:
+///
+/// * `balance`           — not yet earned; decreases each settlement period.
+/// * `claimable_balance` — earned but not yet transferred to the recipient;
+///                         increases on settle, resets to 0 on withdraw.
+///
+/// Both are non-negative. Their sum never exceeds the `initial_balance`
+/// passed to `create_stream`.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct StreamInfo {
     pub payer: Address,
     pub recipient: Address,
+    /// SEP-41-compatible token contract used for this stream.
+    pub token: Address,
+    /// Streaming rate in token units per second.
     pub rate_per_second: i128,
+    /// Tokens still held in escrow; not yet accrued to the recipient.
     pub balance: i128,
+    /// Tokens accrued by the recipient but not yet withdrawn on-ledger.
+    pub claimable_balance: i128,
+    /// Timestamp of the last settlement (or stream start if never settled).
     pub start_time: u64,
+    /// Timestamp when the stream was stopped (0 if never stopped).
     pub end_time: u64,
     pub is_active: bool,
 }
@@ -176,11 +227,18 @@ pub struct StreamPayContract;
 
 #[contractimpl]
 impl StreamPayContract {
-    /// Create a new payment stream (payer, recipient, rate per second).
+    /// Create a new payment stream and immediately escrow `initial_balance` tokens.
+    ///
+    /// `initial_balance` tokens are transferred from `payer` into this contract
+    /// on creation, so `payer` must hold at least `initial_balance` of `token`
+    /// and must authorise both this call and the token transfer.
+    ///
+    /// Returns the new `stream_id`.
     pub fn create_stream(
         env: Env,
         payer: Address,
         recipient: Address,
+        token: Address,
         rate_per_second: i128,
         initial_balance: i128,
     ) -> u32 {
@@ -188,12 +246,19 @@ impl StreamPayContract {
         if rate_per_second <= 0 || initial_balance <= 0 {
             panic!("rate and balance must be positive");
         }
+
+        // Escrow initial_balance tokens from payer into this contract.
+        token::Client::new(&env, &token)
+            .transfer(&payer, &env.current_contract_address(), &initial_balance);
+
         let stream_id = get_next_stream_id(&env);
         let info = StreamInfo {
             payer: payer.clone(),
             recipient,
+            token,
             rate_per_second,
             balance: initial_balance,
+            claimable_balance: 0,
             start_time: 0,
             end_time: 0,
             is_active: false,
@@ -228,7 +293,10 @@ impl StreamPayContract {
         extend_instance_ttl(&env);
     }
 
-    /// Stop an active stream.
+    /// Pause an active stream (payer only).
+    ///
+    /// Records `end_time` so that `withdraw_stream` can later settle the
+    /// final accrual period even after the stream becomes inactive.
     pub fn stop_stream(env: Env, stream_id: u32) {
         let mut info = get_stream(&env, stream_id);
         info.payer.require_auth();
@@ -421,6 +489,69 @@ impl StreamPayContract {
         extend_instance_ttl(&env);
     }
 
+    /// Withdraw all claimable tokens to the recipient (recipient auth required).
+    ///
+    /// Implicitly settles any outstanding accrual before transferring, so the
+    /// recipient does not need to call `settle_stream` first.
+    ///
+    /// For inactive streams, settles the final period between the last
+    /// settlement timestamp (`start_time`) and the stop timestamp (`end_time`),
+    /// ensuring no earned tokens are stranded when the payer stops the stream
+    /// without a prior `settle_stream` call.
+    ///
+    /// Returns the amount transferred on-ledger. Returns 0 if nothing is
+    /// claimable (idempotent — safe to call multiple times).
+    ///
+    /// # Interaction with internal accounting
+    ///
+    /// After a successful withdrawal:
+    /// * `claimable_balance` is reset to 0.
+    /// * `balance` reflects only the un-accrued remainder.
+    /// * `start_time` is advanced to the settlement boundary, preventing
+    ///   the same elapsed period from being double-counted on a future call.
+    pub fn withdraw_stream(env: Env, stream_id: u32) -> i128 {
+        let mut info = get_stream(&env, stream_id);
+        info.recipient.require_auth();
+
+        // Determine the settlement boundary:
+        //   active  → settle up to now
+        //   stopped → settle the gap [start_time, end_time]  (end_time set by stop_stream)
+        //   never started (end_time == 0, is_active == false) → settle_until == 0, no-op
+        let settle_until: u64 = if info.is_active {
+            env.ledger().timestamp()
+        } else {
+            info.end_time
+        };
+
+        if settle_until > info.start_time {
+            let elapsed = settle_until - info.start_time;
+            let accrued = (elapsed as i128)
+                .saturating_mul(info.rate_per_second)
+                .min(info.balance);
+            info.balance = info.balance.saturating_sub(accrued);
+            info.claimable_balance = info.claimable_balance.saturating_add(accrued);
+            // Advance start_time so the same period is never settled twice.
+            info.start_time = settle_until;
+        }
+
+        let claimable = info.claimable_balance;
+        info.claimable_balance = 0;
+
+        // Write state before the external token call (checks-effects-interactions).
+        set_stream(&env, stream_id, &info);
+        extend_stream_ttl(&env, stream_id);
+        extend_instance_ttl(&env);
+
+        if claimable > 0 {
+            // Transfer tokens from this contract to the recipient.
+            // The contract is the sender, so no additional auth is required.
+            token::Client::new(&env, &info.token)
+                .transfer(&env.current_contract_address(), &info.recipient, &claimable);
+        }
+
+        claimable
+    }
+
     /// Get stream info (read-only).
     pub fn get_stream_info(env: Env, stream_id: u32) -> StreamInfo {
         get_stream(&env, stream_id)
@@ -431,8 +562,11 @@ impl StreamPayContract {
         VERSION
     }
 
-    /// Archive (remove) a fully-settled, inactive stream. Payer-only.
-    /// Stream must be inactive and have zero balance to protect recipient entitlements.
+    /// Archive (remove) a fully-settled, fully-withdrawn, inactive stream (payer only).
+    ///
+    /// Requires `is_active == false`, `balance == 0`, and `claimable_balance == 0`.
+    /// The `claimable_balance == 0` guard ensures the recipient has received all
+    /// owed tokens before the stream record is permanently deleted.
     pub fn archive_stream(env: Env, stream_id: u32) {
         let info = get_stream(&env, stream_id);
         info.payer.require_auth();
@@ -441,6 +575,9 @@ impl StreamPayContract {
         }
         if info.balance != 0 {
             panic!("cannot archive stream with unsettled balance");
+        }
+        if info.claimable_balance != 0 {
+            panic!("cannot archive stream with unclaimed balance");
         }
         let key = stream_key(&env, stream_id);
         env.storage().persistent().remove(&key);
@@ -519,6 +656,7 @@ mod test {
 
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::testutils::Ledger as _;
+    use soroban_sdk::token;
 
     use super::*;
 
@@ -537,6 +675,7 @@ mod test {
         let contract_id = env.register(StreamPayContract, ());
         let client = StreamPayContractClient::new(&env, &contract_id);
 
+        let admin = Address::generate(&env);
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
         let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128, &String::from_str(&env, "memo"));
@@ -546,8 +685,10 @@ mod test {
         let info = client.get_stream_info(&stream_id);
         assert_eq!(info.payer, payer);
         assert_eq!(info.recipient, recipient);
+        assert_eq!(info.token, token_address);
         assert_eq!(info.rate_per_second, 100);
         assert_eq!(info.balance, 10_000);
+        assert_eq!(info.claimable_balance, 0);
         assert!(!info.is_active);
         assert_eq!(info.memo, String::from_str(&env, "memo"));
         assert_eq!(info.paused_at, 0);
@@ -564,6 +705,7 @@ mod test {
         let contract_id = env.register(StreamPayContract, ());
         let client = StreamPayContractClient::new(&env, &contract_id);
 
+        let admin = Address::generate(&env);
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
         let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
@@ -600,6 +742,7 @@ mod test {
         let contract_id = env.register(StreamPayContract, ());
         let client = StreamPayContractClient::new(&env, &contract_id);
 
+        let admin = Address::generate(&env);
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
         let stream_id = client.create_stream(&payer, &recipient, &10_i128, &1_000_i128);
@@ -652,6 +795,7 @@ mod test {
         let contract_id = env.register(StreamPayContract, ());
         let client = StreamPayContractClient::new(&env, &contract_id);
 
+        let admin = Address::generate(&env);
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
         let stream_id = client.create_stream(&payer, &recipient, &50_i128, &5_000_i128, &String::from_str(&env, "memo"));
@@ -673,6 +817,7 @@ mod test {
         let contract_id = env.register(StreamPayContract, ());
         let client = StreamPayContractClient::new(&env, &contract_id);
 
+        let admin = Address::generate(&env);
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
         let stream_id = client.create_stream(&payer, &recipient, &50_i128, &5_000_i128);
@@ -698,6 +843,7 @@ mod test {
         let contract_id = env.register(StreamPayContract, ());
         let client = StreamPayContractClient::new(&env, &contract_id);
 
+        let admin = Address::generate(&env);
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
         let stream_id = client.create_stream(&payer, &recipient, &50_i128, &5_000_i128);
@@ -720,6 +866,7 @@ mod test {
         let contract_id = env.register(StreamPayContract, ());
         let client = StreamPayContractClient::new(&env, &contract_id);
 
+        let admin = Address::generate(&env);
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
         let stream_id = client.create_stream(&payer, &recipient, &10_i128, &1_000_i128, &String::from_str(&env, "memo"));
@@ -1134,9 +1281,10 @@ mod test {
         advance_ledger_time(&env, 10);
         client.settle_stream(&stream_id);
         client.stop_stream(&stream_id);
+        client.withdraw_stream(&stream_id); // clear claimable before archive
         client.archive_stream(&stream_id);
 
-        // Should panic — stream was archived (removed from storage)
+        // Panics — stream was archived.
         client.get_stream_info(&stream_id);
     }
 
