@@ -378,6 +378,46 @@ impl StreamPayContract {
         env.storage().persistent().remove(&key);
         extend_instance_ttl(&env);
     }
+
+    /// Update the rate of an existing stream (payer-only).
+    /// If the stream is active, automatically settles accrued amount at old rate first.
+    /// Policy: Rate can only be decreased or changed within a bounded delta (max 10% increase)
+    /// to protect recipient expectations while allowing payer flexibility.
+    pub fn update_rate(env: Env, stream_id: u32, new_rate: i128) {
+        let mut info = get_stream(&env, stream_id);
+        info.payer.require_auth();
+
+        if new_rate <= 0 {
+            panic!("rate must be positive");
+        }
+
+        let old_rate = info.rate_per_second;
+
+        // Policy: Only allow rate decrease or small increases (max 10% increase)
+        // This protects recipient expectations while allowing payer flexibility
+        let max_allowed_rate = old_rate + (old_rate / 10); // 110% of current rate
+        if new_rate > max_allowed_rate {
+            panic!("rate increase exceeds 10% limit");
+        }
+
+        // If stream is active, settle at old rate before changing
+        if info.is_active {
+            let now = env.ledger().timestamp();
+            let elapsed = now - info.start_time;
+            let amount = (elapsed as i128)
+                .saturating_mul(old_rate)
+                .min(info.balance);
+            info.balance = info.balance.saturating_sub(amount);
+            // Reset start_time to now so new rate applies going forward
+            info.start_time = now;
+        }
+
+        // Update the rate
+        info.rate_per_second = new_rate;
+        set_stream(&env, stream_id, &info);
+        extend_stream_ttl(&env, stream_id);
+        extend_instance_ttl(&env);
+    }
 }
 
 fn get_next_stream_id(env: &Env) -> u32 {
@@ -1030,5 +1070,192 @@ mod test {
 
         // Should panic — stream was archived (removed from storage)
         client.get_stream_info(&stream_id);
+    }
+
+    #[test]
+    fn test_update_rate_inactive_stream() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+
+        // Update rate while inactive
+        client.update_rate(&stream_id, &80_i128);
+
+        let info = client.get_stream_info(&stream_id);
+        assert_eq!(info.rate_per_second, 80);
+        assert_eq!(info.balance, 10_000); // Balance unchanged
+    }
+
+    #[test]
+    fn test_update_rate_active_stream_settles_first() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        // rate=100/s, balance=10000
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+        client.start_stream(&stream_id);
+
+        // Advance 10 seconds
+        env.ledger().with_mut(|li| {
+            li.timestamp += 10;
+        });
+
+        // Update rate to 50/s — should settle 1000 (10s * 100/s) first
+        client.update_rate(&stream_id, &50_i128);
+
+        let info = client.get_stream_info(&stream_id);
+        assert_eq!(info.rate_per_second, 50);
+        assert_eq!(info.balance, 9_000); // 10000 - 1000
+        assert!(info.is_active);
+    }
+
+    #[test]
+    fn test_update_rate_accrual_correctness() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        // rate=100/s, balance=10000
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+        client.start_stream(&stream_id);
+
+        // Advance 5 seconds at rate 100/s → 500 accrued
+        env.ledger().with_mut(|li| {
+            li.timestamp += 5;
+        });
+
+        // Change rate to 50/s
+        client.update_rate(&stream_id, &50_i128);
+        let info = client.get_stream_info(&stream_id);
+        assert_eq!(info.balance, 9_500); // 10000 - 500
+
+        // Advance another 10 seconds at rate 50/s → 500 more accrued
+        env.ledger().with_mut(|li| {
+            li.timestamp += 10;
+        });
+
+        let amount = client.settle_stream(&stream_id);
+        assert_eq!(amount, 500); // 10s * 50/s
+
+        let info = client.get_stream_info(&stream_id);
+        assert_eq!(info.balance, 9_000); // 9500 - 500
+    }
+
+    #[test]
+    fn test_update_rate_decrease_allowed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &1000_i128, &100_000_i128);
+
+        // Decrease by 90% — should be allowed
+        client.update_rate(&stream_id, &100_i128);
+
+        let info = client.get_stream_info(&stream_id);
+        assert_eq!(info.rate_per_second, 100);
+    }
+
+    #[test]
+    fn test_update_rate_small_increase_allowed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+
+        // Increase by 10% — should be allowed
+        client.update_rate(&stream_id, &110_i128);
+
+        let info = client.get_stream_info(&stream_id);
+        assert_eq!(info.rate_per_second, 110);
+    }
+
+    #[test]
+    #[should_panic(expected = "rate increase exceeds 10% limit")]
+    fn test_update_rate_large_increase_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+
+        // Increase by 20% — should panic
+        client.update_rate(&stream_id, &120_i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "rate must be positive")]
+    fn test_update_rate_zero_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+
+        client.update_rate(&stream_id, &0_i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "rate must be positive")]
+    fn test_update_rate_negative_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+
+        client.update_rate(&stream_id, &-50_i128);
+    }
+
+    #[test]
+    fn test_update_rate_multiple_times() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &1000_i128, &100_000_i128);
+
+        // First decrease
+        client.update_rate(&stream_id, &500_i128);
+        assert_eq!(client.get_stream_info(&stream_id).rate_per_second, 500);
+
+        // Second decrease
+        client.update_rate(&stream_id, &250_i128);
+        assert_eq!(client.get_stream_info(&stream_id).rate_per_second, 250);
+
+        // Small increase (10% of 250 = 25, so max 275)
+        client.update_rate(&stream_id, &275_i128);
+        assert_eq!(client.get_stream_info(&stream_id).rate_per_second, 275);
     }
 }
