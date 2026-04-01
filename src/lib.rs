@@ -528,6 +528,11 @@ impl StreamPayContract {
         claimable
     }
 
+    /// Returns whether a stream is currently active.
+    pub fn is_stream_active(env: Env, stream_id: u32) -> bool {
+        get_stream(&env, stream_id).is_active
+    }
+
     /// Get stream info (read-only).
     pub fn get_stream_info(env: Env, stream_id: u32) -> StreamInfo {
         get_stream(&env, stream_id)
@@ -795,7 +800,7 @@ mod test {
         let admin = Address::generate(&env);
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &50_i128, &5_000_i128);
+        let stream_id = client.create_stream(&payer, &recipient, &50_i128, &5_000_i128, &0_u64);
 
         client.stop_stream(&stream_id);
     }
@@ -821,7 +826,7 @@ mod test {
         let admin = Address::generate(&env);
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
-        let stream_id = client.create_stream(&payer, &recipient, &50_i128, &5_000_i128);
+        let stream_id = client.create_stream(&payer, &recipient, &50_i128, &5_000_i128, &0_u64);
         client.start_stream(&stream_id);
 
         env.set_auths(&[]);
