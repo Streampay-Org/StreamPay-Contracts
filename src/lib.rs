@@ -89,9 +89,9 @@ pub struct StreamInfo {
     pub rate_per_second: i128,
     pub balance: i128,
     pub start_time: u64,
-    pub end_time: u64,           // Max duration: stream auto-deactivates at this time
+    pub end_time: u64, // Max duration: stream auto-deactivates at this time
     pub is_active: bool,
-    pub paused_at: u64,          // 0 if not paused; timestamp of pause if paused
+    pub paused_at: u64, // 0 if not paused; timestamp of pause if paused
 }
 
 /// Event data emitted when a new stream is created.
@@ -123,7 +123,7 @@ impl StreamPayContract {
         recipient: Address,
         rate_per_second: i128,
         initial_balance: i128,
-        end_time: u64,  // 0 = no limit; otherwise must be > start_time (validated at start)
+        end_time: u64, // 0 = no limit; otherwise must be > start_time (validated at start)
     ) -> u32 {
         payer.require_auth();
         if rate_per_second <= 0 || initial_balance <= 0 {
@@ -144,7 +144,14 @@ impl StreamPayContract {
         set_next_stream_id(&env, stream_id + 1);
         extend_stream_ttl(&env, stream_id);
         extend_instance_ttl(&env);
-        emit_stream_created(&env, stream_id, &payer, &info.recipient, rate_per_second, initial_balance);
+        emit_stream_created(
+            &env,
+            stream_id,
+            &payer,
+            &info.recipient,
+            rate_per_second,
+            initial_balance,
+        );
         stream_id
     }
 
@@ -157,15 +164,15 @@ impl StreamPayContract {
             panic!("stream already active");
         }
         let now = env.ledger().timestamp();
-        
+
         // Validate end_time constraint if set
         if info.end_time > 0 && info.end_time <= now {
             panic!("end_time must be in the future");
         }
-        
+
         info.is_active = true;
         info.start_time = now;
-        info.paused_at = 0;  // Clear paused state
+        info.paused_at = 0; // Clear paused state
         set_stream(&env, stream_id, &info);
         extend_stream_ttl(&env, stream_id);
         extend_instance_ttl(&env);
@@ -180,7 +187,7 @@ impl StreamPayContract {
         }
         info.is_active = false;
         info.end_time = env.ledger().timestamp();
-        info.paused_at = 0;  // Clear paused state
+        info.paused_at = 0; // Clear paused state
         set_stream(&env, stream_id, &info);
         extend_stream_ttl(&env, stream_id);
         extend_instance_ttl(&env);
@@ -254,24 +261,24 @@ impl StreamPayContract {
     pub fn cancel_stream(env: Env, stream_id: u32) {
         let mut info = get_stream(&env, stream_id);
         info.payer.require_auth();
-        
+
         if !info.is_active {
             panic!("cannot cancel inactive stream");
         }
-        
+
         let now = env.ledger().timestamp();
-        
+
         // Settle accrued amount up to cancellation
         let elapsed = now - info.start_time;
         let accrued = (elapsed as i128)
             .saturating_mul(info.rate_per_second)
             .min(info.balance);
-        
+
         // Deduct accrued from balance (paid to recipient)
         info.balance = info.balance.saturating_sub(accrued);
         info.is_active = false;
-        info.end_time = now;  // Mark cancellation point
-        
+        info.end_time = now; // Mark cancellation point
+
         set_stream(&env, stream_id, &info);
         extend_stream_ttl(&env, stream_id);
         extend_instance_ttl(&env);
@@ -284,26 +291,26 @@ impl StreamPayContract {
     pub fn pause_stream(env: Env, stream_id: u32) {
         let mut info = get_stream(&env, stream_id);
         info.payer.require_auth();
-        
+
         if !info.is_active {
             panic!("cannot pause inactive stream");
         }
         if info.paused_at > 0 {
             panic!("stream already paused");
         }
-        
+
         let now = env.ledger().timestamp();
-        
+
         // Settle accrued amount up to pause point
         let elapsed = now - info.start_time;
         let accrued = (elapsed as i128)
             .saturating_mul(info.rate_per_second)
             .min(info.balance);
         info.balance = info.balance.saturating_sub(accrued);
-        
+
         // Mark paused but keep is_active true (logical "paused" state)
         info.paused_at = now;
-        
+
         set_stream(&env, stream_id, &info);
         extend_stream_ttl(&env, stream_id);
         extend_instance_ttl(&env);
@@ -315,20 +322,20 @@ impl StreamPayContract {
     pub fn resume_stream(env: Env, stream_id: u32) {
         let mut info = get_stream(&env, stream_id);
         info.payer.require_auth();
-        
+
         if !info.is_active {
             panic!("cannot resume inactive stream");
         }
         if info.paused_at == 0 {
             panic!("stream is not paused");
         }
-        
+
         let now = env.ledger().timestamp();
-        
+
         // Resume: reset start_time to account for paused duration and clear paused state
         info.start_time = now;
         info.paused_at = 0;
-        
+
         set_stream(&env, stream_id, &info);
         extend_stream_ttl(&env, stream_id);
         extend_instance_ttl(&env);
@@ -705,8 +712,10 @@ mod test {
         let payer = Address::generate(&env);
         let recipient_a = Address::generate(&env);
         let recipient_b = Address::generate(&env);
-        let first_stream_id = client.create_stream(&payer, &recipient_a, &10_i128, &1_000_i128, &0_u64);
-        let second_stream_id = client.create_stream(&payer, &recipient_b, &5_i128, &1_000_i128, &0_u64);
+        let first_stream_id =
+            client.create_stream(&payer, &recipient_a, &10_i128, &1_000_i128, &0_u64);
+        let second_stream_id =
+            client.create_stream(&payer, &recipient_b, &5_i128, &1_000_i128, &0_u64);
         client.start_stream(&first_stream_id);
         client.start_stream(&second_stream_id);
 
@@ -978,10 +987,16 @@ mod test {
 
         let amount = client.settle_stream(&stream_id);
         // Saturating mul: i128::MAX * 1 = i128::MAX, clamped to balance
-        assert_eq!(amount, balance, "extreme rate must settle exactly the balance, not more");
+        assert_eq!(
+            amount, balance,
+            "extreme rate must settle exactly the balance, not more"
+        );
 
         let info = client.get_stream_info(&stream_id);
-        assert_eq!(info.balance, 0, "balance must be fully drained, not negative");
+        assert_eq!(
+            info.balance, 0,
+            "balance must be fully drained, not negative"
+        );
     }
 
     /// Extreme elapsed: simulate a very long window (u64::MAX seconds) with a
@@ -1007,7 +1022,10 @@ mod test {
         });
 
         let amount = client.settle_stream(&stream_id);
-        assert_eq!(amount, balance, "extreme elapsed must settle exactly the balance");
+        assert_eq!(
+            amount, balance,
+            "extreme elapsed must settle exactly the balance"
+        );
 
         let info = client.get_stream_info(&stream_id);
         assert_eq!(info.balance, 0, "balance must reach zero, not go negative");
@@ -1101,7 +1119,10 @@ mod test {
         });
 
         let amount = client.settle_stream(&stream_id);
-        assert_eq!(amount, 50, "partial accrual should be exact when no saturation");
+        assert_eq!(
+            amount, 50,
+            "partial accrual should be exact when no saturation"
+        );
 
         let info = client.get_stream_info(&stream_id);
         assert_eq!(info.balance, 9_950);
@@ -1122,7 +1143,10 @@ mod test {
 
         // No time advance — elapsed = 0
         let amount = client.settle_stream(&stream_id);
-        assert_eq!(amount, 0, "zero elapsed must yield zero amount even with max rate");
+        assert_eq!(
+            amount, 0,
+            "zero elapsed must yield zero amount even with max rate"
+        );
     }
 
     /// Multiple sequential settles with extreme rate — each settle drains
@@ -1137,7 +1161,8 @@ mod test {
         let payer = Address::generate(&env);
         let recipient = Address::generate(&env);
         let initial_balance = 300_i128;
-        let stream_id = client.create_stream(&payer, &recipient, &i128::MAX, &initial_balance, &0_u64);
+        let stream_id =
+            client.create_stream(&payer, &recipient, &i128::MAX, &initial_balance, &0_u64);
         client.start_stream(&stream_id);
 
         let mut total_settled = 0_i128;
