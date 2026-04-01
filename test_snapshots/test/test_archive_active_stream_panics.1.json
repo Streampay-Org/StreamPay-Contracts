@@ -41,6 +41,9 @@
                     "hi": 0,
                     "lo": 10000
                   }
+                },
+                {
+                  "bool": false
                 }
               ]
             }
@@ -302,6 +305,14 @@
                       },
                       "val": {
                         "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "recipient_can_stop"
+                      },
+                      "val": {
+                        "bool": false
                       }
                     },
                     {

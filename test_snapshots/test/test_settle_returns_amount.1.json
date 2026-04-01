@@ -41,6 +41,9 @@
                     "hi": 0,
                     "lo": 1000
                   }
+                },
+                {
+                  "bool": false
                 }
               ]
             }
@@ -134,7 +137,7 @@
   "ledger": {
     "protocol_version": 22,
     "sequence_number": 0,
-    "timestamp": 0,
+    "timestamp": 10,
     "network_id": "0000000000000000000000000000000000000000000000000000000000000000",
     "base_reserve": 0,
     "min_persistent_entry_ttl": 4096,
@@ -246,7 +249,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 1000
+                          "lo": 900
                         }
                       }
                     },
@@ -306,10 +309,18 @@
                     },
                     {
                       "key": {
+                        "symbol": "recipient_can_stop"
+                      },
+                      "val": {
+                        "bool": false
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "start_time"
                       },
                       "val": {
-                        "u64": 0
+                        "u64": 10
                       }
                     },
                     {
