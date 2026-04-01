@@ -34,7 +34,7 @@
 //! StreamPay — Soroban smart contracts for continuous payment streaming.
 //!
 //! Provides: create_stream, start_stream, stop_stream, settle_stream,
-//! archive_stream, get_stream_info, version.
+//! archive_stream, is_stream_active, get_stream_info, version.
 //!
 //! # Integer Safety — i128 Saturation Semantics
 //!
@@ -362,6 +362,11 @@ impl StreamPayContract {
         set_stream(&env, stream_id, &info);
         extend_stream_ttl(&env, stream_id);
         extend_instance_ttl(&env);
+    }
+
+    /// Returns whether a stream is currently active.
+    pub fn is_stream_active(env: Env, stream_id: u32) -> bool {
+        get_stream(&env, stream_id).is_active
     }
 
     /// Get stream info (read-only).
@@ -801,6 +806,36 @@ mod test {
         }
 
         client.batch_settle(&stream_ids);
+    }
+
+    #[test]
+    fn test_is_stream_active_tracks_lifecycle() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &10_i128, &1_000_i128);
+
+        assert!(!client.is_stream_active(&stream_id));
+
+        client.start_stream(&stream_id);
+        assert!(client.is_stream_active(&stream_id));
+
+        client.stop_stream(&stream_id);
+        assert!(!client.is_stream_active(&stream_id));
+    }
+
+    #[test]
+    #[should_panic(expected = "stream not found")]
+    fn test_is_stream_active_missing_id_panics() {
+        let env = Env::default();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        client.is_stream_active(&999_u32);
     }
 
     #[test]
