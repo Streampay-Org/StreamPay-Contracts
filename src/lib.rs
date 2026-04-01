@@ -136,6 +136,74 @@ impl StreamPayContract {
         emit_stream_created(&env, stream_id, &payer, &info.recipient, rate_per_second, initial_balance);
         stream_id
     }
+####
+
+
+//! StreamPay — Soroban smart contracts for continuous payment streaming.
+//!
+//! Provides: create_stream, start_stream, stop_stream, settle_stream,
+//! archive_stream, get_stream_info, version.
+
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
+
+/// Contract version: major * 1_000_000 + minor * 1_000 + patch.
+/// Current: 0.1.0 → 1_000
+const VERSION: u32 = 1_000;
+
+/// TTL threshold: extend when remaining TTL drops below ~1 day (17_280 ledgers at ~5s each).
+const STREAM_TTL_THRESHOLD: u32 = 17_280;
+/// TTL extend-to: refresh to ~30 days (518_400 ledgers).
+const STREAM_TTL_EXTEND: u32 = 518_400;
+/// Instance storage TTL threshold (~1 day).
+const INSTANCE_TTL_THRESHOLD: u32 = 17_280;
+/// Instance storage TTL extend-to (~30 days).
+const INSTANCE_TTL_EXTEND: u32 = 518_400;
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct StreamInfo {
+    pub payer: Address,
+    pub recipient: Address,
+    pub rate_per_second: i128,
+    pub balance: i128,
+    pub start_time: u64,
+    pub end_time: u64,
+    pub is_active: bool,
+}
+
+#[contract]
+pub struct StreamPayContract;
+
+#[contractimpl]
+impl StreamPayContract {
+    /// Create a new payment stream (payer, recipient, rate per second).
+    pub fn create_stream(
+        env: Env,
+        payer: Address,
+        recipient: Address,
+        rate_per_second: i128,
+        initial_balance: i128,
+    ) -> u32 {
+        payer.require_auth();
+        if rate_per_second <= 0 || initial_balance <= 0 {
+            panic!("rate and balance must be positive");
+        }
+        let stream_id = get_next_stream_id(&env);
+        let info = StreamInfo {
+            payer: payer.clone(),
+            recipient,
+            rate_per_second,
+            balance: initial_balance,
+            start_time: 0,
+            end_time: 0,
+            is_active: false,
+        };
+        set_stream(&env, stream_id, &info);
+        set_next_stream_id(&env, stream_id + 1);
+        extend_stream_ttl(&env, stream_id);
+        extend_instance_ttl(&env);
+        stream_id
+    }
 
     /// Start an existing stream.
     /// If end_time was set at creation, validates that end_time > current timestamp.
