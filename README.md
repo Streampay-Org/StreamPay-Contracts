@@ -28,6 +28,8 @@ This repo contains the on-chain logic for creating, starting, stopping, and sett
 Streams are stored in **Soroban persistent storage** with per-stream TTL
 management. Each stream is an independent ledger entry that can expire
 independently. The contract instance storage holds only the `next_id` counter.
+The counter is 1-based; once it rolls over, the contract stores `0` as an
+exhausted sentinel and rejects further stream creation with `stream id overflow`.
 
 See `docs/factory-pattern.md` for the full design rationale and future factory
 pattern graduation path.
