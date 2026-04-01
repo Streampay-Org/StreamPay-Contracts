@@ -1,12 +1,9 @@
 [advisories]
-vulnerability = "deny"
 yanked = "deny"
-unmaintained = "warn"
-notice = "warn"
+unmaintained = "none"
 ignore = []
 
 [licenses]
-unlicensed = "deny"
 allow = [
     "MIT",
     "Apache-2.0",
@@ -14,14 +11,12 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
-    "Unicode-DFL",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
     "Zlib",
     "CC0-1.0",
     "MPL-2.0",
 ]
-copyleft = "warn"
-allow-osi-fsf-free = "neither"
-default = "deny"
 exceptions = []
 
 [bans]

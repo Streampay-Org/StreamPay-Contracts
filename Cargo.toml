@@ -3,6 +3,7 @@ name = "streampay-contracts"
 version = "0.1.0"
 edition = "2021"
 description = "StreamPay Soroban smart contracts for payment streaming"
+license = "MIT"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
