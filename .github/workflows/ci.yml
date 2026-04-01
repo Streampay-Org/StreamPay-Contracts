@@ -35,6 +35,9 @@ jobs:
             echo "stellar-cli already installed"
           fi
 
+      - name: Check licenses and advisories
+        uses: EmbarkStudios/cargo-deny-action@v2
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 

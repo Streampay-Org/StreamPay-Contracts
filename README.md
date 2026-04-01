@@ -8,20 +8,28 @@ This repo contains the on-chain logic for creating, starting, stopping, and sett
 
 ### Contract interface
 
-- **`create_stream(payer, recipient, rate_per_second, initial_balance)`** — Create a new stream (payer must auth).
+- **`create_stream(payer, recipient, rate_per_second, initial_balance, recipient_can_stop)`** — Create a new stream (payer must auth). Set `recipient_can_stop = true` to allow the recipient to also stop the stream; defaults to `false` (payer-only).
 - **`start_stream(stream_id)`** — Start an existing stream.
-- **`stop_stream(stream_id)`** — Stop an active stream.
+- **`stop_stream(stream_id, stopper)`** — Stop an active stream. `stopper` must be the payer (always allowed) or the recipient (only when `recipient_can_stop` was set at creation). `stopper` must authorise the call.
 - **`settle_stream(stream_id)`** — Compute and deduct streamed amount since last settlement; returns amount.
-- **`update_rate(stream_id, new_rate)`** — Update stream rate mid-stream (payer must auth). Automatically settles at old rate first if active. Policy: max 10% increase allowed, unlimited decrease.
+- **`batch_settle(stream_ids)`** — Settle multiple streams in a single call; returns one settled amount per input id.
 - **`archive_stream(stream_id)`** — Remove a fully-settled, inactive stream from storage (payer must auth).
-- **`get_stream_info(stream_id)`** — Read stream metadata (payer, recipient, rate, balance, timestamps, active).
+- **`get_stream_info(stream_id)`** — Read stream metadata (payer, recipient, rate, balance, timestamps, active, recipient_can_stop).
 - **`version()`** — Returns the contract version as a `u32` (no auth required).
+
+### Batch settlement semantics
+
+- `batch_settle` is all-or-nothing. If any stream id is missing or any item panics, the entire invocation reverts and no settlement updates are committed.
+- Inactive streams settle to `0`, matching `settle_stream`.
+- The contract caps each batch at `25` stream ids to keep Soroban resource usage predictable. Off-chain indexers and payroll processors should chunk larger workloads into multiple transactions.
 
 ## Storage Model
 
 Streams are stored in **Soroban persistent storage** with per-stream TTL
 management. Each stream is an independent ledger entry that can expire
 independently. The contract instance storage holds only the `next_id` counter.
+The counter is 1-based; once it rolls over, the contract stores `0` as an
+exhausted sentinel and rejects further stream creation with `stream id overflow`.
 
 See `docs/factory-pattern.md` for the full design rationale and future factory
 pattern graduation path.
@@ -42,6 +50,60 @@ When releasing, update **both** `Cargo.toml` `version` and the `VERSION` const i
 
 - [Rust](https://rustup.rs/) (stable, with `rustfmt`)
 - Optional: [Stellar CLI](https://developers.stellar.org/docs/tools/stellar-cli) for deployment
+
+Note: this crate uses `soroban-sdk` version 22.0 (see `Cargo.toml`).
+
+Building, testing and deploying (copy-paste)
+-----------------------------------------
+
+1) Build optimized WASM (recommended via Docker builder included):
+
+```bash
+# Build with local toolchain (WASM output in target/)
+cargo build --release --target wasm32-unknown-unknown
+
+# OR use deterministic Docker builder (produces streampay_contracts.wasm)
+docker build -f docker/Dockerfile.build -t streampay-wasm .
+docker run --rm -v "$(pwd)":/work streampay-wasm
+```
+
+2) Run unit tests locally:
+
+```bash
+cargo test
+```
+
+3) Deploy to Futurenet/Testnet using `soroban` CLI (example):
+
+```bash
+# install soroban CLI if not installed
+curl -sSf https://soroban.stellar.org/install.sh | bash
+
+# set the network (futurenet/testnet)
+soroban config set network futurenet
+
+# upload contract and get contract id (example paths)
+soroban contract publish --wasm target/wasm32-unknown-unknown/release/streampay_contracts.wasm
+
+# note the contract id printed by the publish command
+```
+
+4) Example invocation (replace `<CONTRACT_ID>` and addresses):
+
+```bash
+# create_stream(payer, recipient, rate_per_second, initial_balance)
+soroban contract invoke --wasm target/wasm32-unknown-unknown/release/streampay_contracts.wasm \
+   --id <CONTRACT_ID> --fn create_stream --args <PAYER_ADDRESS> <RECIPIENT_ADDRESS> 100 10000
+
+# start_stream(stream_id)
+soroban contract invoke --id <CONTRACT_ID> --fn start_stream --args 1
+```
+
+Notes
+-----
+- The exact `soroban` CLI flags depend on the CLI version; consult `soroban --help`.
+- For deterministic WASM builds in CI, use the provided `docker/Dockerfile.build` which pins the Rust toolchain.
+- Ensure the `soroban-sdk` version in `Cargo.toml` is compatible with your `soroban` CLI and network.
 
 ## Setup for contributors
 
@@ -114,3 +176,12 @@ streampay-contracts/
 ## License
 
 MIT
+
+## Documentation
+
+| Doc | Description |
+|---|---|
+| [`docs/timestamp-accrual.md`](docs/timestamp-accrual.md) | Ledger timestamp assumptions: validator behavior, coarse granularity, accrual edge cases, off-chain UX rounding |
+| [`SECURITY.md`](SECURITY.md) | Security policy and responsible disclosure |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contribution guidelines |
+| [`CHANGELOG.md`](CHANGELOG.md) | Release history |
