@@ -104,6 +104,10 @@ impl StreamPayContract {
             panic!("rate and balance must be positive");
         }
         let stream_id = get_next_stream_id(&env);
+        if stream_id == 0 {
+            panic!("stream id overflow");
+        }
+        let next_stream_id = stream_id.wrapping_add(1);
         let info = StreamInfo {
             payer: payer.clone(),
             recipient,
@@ -115,7 +119,7 @@ impl StreamPayContract {
             paused_at: 0,
         };
         set_stream(&env, stream_id, &info);
-        set_next_stream_id(&env, stream_id + 1);
+        set_next_stream_id(&env, next_stream_id);
         extend_stream_ttl(&env, stream_id);
         extend_instance_ttl(&env);
         emit_stream_created(&env, stream_id, &payer, &info.recipient, rate_per_second, initial_balance);
@@ -477,6 +481,38 @@ mod test {
         client.start_stream(&stream_id);
         client.stop_stream(&stream_id);
         assert_eq!(env.events().all().len(), after_create);
+    }
+
+    #[test]
+    fn test_create_stream_allows_last_u32_id() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        set_next_stream_id(&env, u32::MAX);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
+
+        assert_eq!(stream_id, u32::MAX);
+        assert_eq!(get_next_stream_id(&env), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "stream id overflow")]
+    fn test_create_stream_panics_when_id_would_overflow() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        set_next_stream_id(&env, 0);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        client.create_stream(&payer, &recipient, &100_i128, &10_000_i128);
     }
 
     #[test]
