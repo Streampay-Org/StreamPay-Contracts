@@ -134,6 +134,7 @@ Notes
 | `cargo test`   | Run unit tests             |
 | `cargo fmt`    | Format code                |
 | `cargo fmt --all -- --check` | Check formatting (CI) |
+| `./scripts/check-wasm-size.sh` | Check optimized WASM size |
 
 ## CI/CD
 
@@ -142,8 +143,9 @@ On every push/PR to `main`, GitHub Actions runs:
 - Format check: `cargo fmt --all -- --check`
 - Build: `cargo build`
 - Tests: `cargo test`
+- WASM size check: Reports optimized contract size and warns if approaching limits
 
-Ensure all three pass before merging.
+Ensure all checks pass before merging. See [docs/resource-limits.md](docs/resource-limits.md) for details on Soroban resource constraints.
 
 ## Releases
 
