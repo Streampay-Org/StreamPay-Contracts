@@ -222,6 +222,14 @@ pub struct StreamInfo {
     pub is_active: bool,
 }
 
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SettleEvent {
+    pub stream_id: u32,
+    pub amount: i128,
+    pub post_balance: i128,
+}
+
 #[contract]
 pub struct StreamPayContract;
 
@@ -515,6 +523,16 @@ impl StreamPayContract {
 
         // Write state before the external token call (checks-effects-interactions).
         set_stream(&env, stream_id, &info);
+        if amount > 0 {
+            env.events().publish(
+                (Symbol::new(&env, "settle"),),
+                SettleEvent {
+                    stream_id,
+                    amount,
+                    post_balance: info.balance,
+                },
+            );
+        }
         extend_stream_ttl(&env, stream_id);
         extend_instance_ttl(&env);
 
