@@ -220,6 +220,15 @@ pub struct StreamInfo {
     /// Timestamp when the stream was stopped (0 if never stopped).
     pub end_time: u64,
     pub is_active: bool,
+    pub operator: Option<Address>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SettleEvent {
+    pub stream_id: u32,
+    pub amount: i128,
+    pub post_balance: i128,
 }
 
 #[contract]
@@ -262,6 +271,7 @@ impl StreamPayContract {
             start_time: 0,
             end_time: 0,
             is_active: false,
+            operator: None,
         };
         set_stream(&env, stream_id, &info);
         set_next_stream_id(&env, stream_id + 1);
@@ -275,6 +285,19 @@ impl StreamPayContract {
     pub fn start_stream(env: Env, stream_id: u32) {
         let mut info = get_stream(&env, stream_id);
         info.payer.require_auth();
+        info.operator = operator;
+        set_stream(&env, stream_id, &info);
+        extend_stream_ttl(&env, stream_id);
+        extend_instance_ttl(&env);
+    }
+
+    /// Start an existing stream.
+    pub fn start_stream(env: Env, caller: Address, stream_id: u32) {
+        caller.require_auth();
+        let mut info = get_stream(&env, stream_id);
+        if caller != info.payer && info.operator != Some(caller) {
+            panic!("not authorized");
+        }
         if info.is_active {
             panic!("stream already active");
         }
@@ -299,7 +322,9 @@ impl StreamPayContract {
     /// final accrual period even after the stream becomes inactive.
     pub fn stop_stream(env: Env, stream_id: u32) {
         let mut info = get_stream(&env, stream_id);
-        info.payer.require_auth();
+        if caller != info.payer && info.operator != Some(caller) {
+            panic!("not authorized");
+        }
         if !info.is_active {
             panic!("stream not active");
         }
@@ -515,6 +540,16 @@ impl StreamPayContract {
 
         // Write state before the external token call (checks-effects-interactions).
         set_stream(&env, stream_id, &info);
+        if amount > 0 {
+            env.events().publish(
+                (Symbol::new(&env, "settle"),),
+                SettleEvent {
+                    stream_id,
+                    amount,
+                    post_balance: info.balance,
+                },
+            );
+        }
         extend_stream_ttl(&env, stream_id);
         extend_instance_ttl(&env);
 
@@ -1110,7 +1145,7 @@ mod test {
         env.ledger().with_mut(|li| {
             li.timestamp += 15;
         });
-        let amount = client.settle_stream(&stream_id);
+        let amount = client.settle_stream(&payer, &stream_id);
         assert_eq!(amount, 1_000);
 
         let info = client.get_stream_info(&stream_id);

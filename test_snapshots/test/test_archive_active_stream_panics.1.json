@@ -123,6 +123,9 @@
               "function_name": "start_stream",
               "args": [
                 {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                },
+                {
                   "u32": 1
                 }
               ]
@@ -279,6 +282,12 @@
                       "val": {
                         "bool": true
                       }
+                    },
+                    {
+                      "key": {
+                        "symbol": "operator"
+                      },
+                      "val": "void"
                     },
                     {
                       "key": {

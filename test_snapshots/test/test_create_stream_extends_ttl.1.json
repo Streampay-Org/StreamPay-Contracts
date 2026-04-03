@@ -263,6 +263,12 @@
                     },
                     {
                       "key": {
+                        "symbol": "operator"
+                      },
+                      "val": "void"
+                    },
+                    {
+                      "key": {
                         "symbol": "payer"
                       },
                       "val": {
