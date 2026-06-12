@@ -1,7 +1,23 @@
 /target
+target/
 **/*.rs.bk
 .env
+.env.local
 .idea
+.vscode/
 *.iml
 artifacts/
 docs/superpowers/
+
+# Soroban / WASM build artifacts
+*.wasm
+*.wasm.gz
+*.optimized.wasm
+
+# macOS
+.DS_Store
+
+# Editor backup files
+*~
+*.swp
+*.swo
