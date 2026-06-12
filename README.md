@@ -180,6 +180,11 @@ MIT
 | Doc | Description |
 |---|---|
 | [`docs/timestamp-accrual.md`](docs/timestamp-accrual.md) | Ledger timestamp assumptions: validator behavior, coarse granularity, accrual edge cases, off-chain UX rounding |
+| [`docs/error-codes.md`](docs/error-codes.md) | Canonical list of panic strings the contract can emit |
+| [`docs/glossary.md`](docs/glossary.md) | Definitions for terms used across the codebase and docs |
+| [`docs/local-development.md`](docs/local-development.md) | Contributor environment setup |
+| [`docs/scripts.md`](docs/scripts.md) | Reference for the helper scripts under `scripts/` |
+| [`docs/ttl-strategy.md`](docs/ttl-strategy.md) | Persistent storage TTL refresh strategy |
 | [`SECURITY.md`](SECURITY.md) | Security policy and responsible disclosure |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contribution guidelines |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release history |
