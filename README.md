@@ -53,8 +53,7 @@ When releasing, update **both** `Cargo.toml` `version` and the `VERSION` const i
 
 Note: this crate uses `soroban-sdk` version 22.0 (see `Cargo.toml`).
 
-Building, testing and deploying (copy-paste)
------------------------------------------
+## Building, testing and deploying
 
 1) Build optimized WASM (recommended via Docker builder included):
 
@@ -99,8 +98,7 @@ soroban contract invoke --wasm target/wasm32-unknown-unknown/release/streampay_c
 soroban contract invoke --id <CONTRACT_ID> --fn start_stream --args 1
 ```
 
-Notes
------
+### Notes
 - The exact `soroban` CLI flags depend on the CLI version; consult `soroban --help`.
 - For deterministic WASM builds in CI, use the provided `docker/Dockerfile.build` which pins the Rust toolchain.
 - Ensure the `soroban-sdk` version in `Cargo.toml` is compatible with your `soroban` CLI and network.
