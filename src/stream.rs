@@ -28,10 +28,18 @@ pub struct StreamInfo {
     pub is_active: bool,
 }
 
+/// Build the persistent storage key used for the given stream id.
+///
+/// All access to a stream's `StreamInfo` MUST go through this helper so that
+/// the (`Symbol`, `u32`) tuple shape stays consistent across the contract.
 pub fn stream_key(env: &Env, stream_id: u32) -> (Symbol, u32) {
     (Symbol::new(env, "stream"), stream_id)
 }
 
+/// Load a `StreamInfo` from persistent storage.
+///
+/// Panics with `"stream not found"` if no entry exists for the id, which can
+/// happen if the stream was archived or never created.
 pub fn get_stream(env: &Env, stream_id: u32) -> StreamInfo {
     let key = stream_key(env, stream_id);
     env.storage()
@@ -40,11 +48,19 @@ pub fn get_stream(env: &Env, stream_id: u32) -> StreamInfo {
         .unwrap_or_else(|| panic!("stream not found"))
 }
 
+/// Persist `info` under the canonical key for `stream_id`.
+///
+/// Callers should also invoke [`extend_stream_ttl`] after mutating a stream
+/// so its persistent entry does not expire prematurely.
 pub fn set_stream(env: &Env, stream_id: u32, info: &StreamInfo) {
     let key = stream_key(env, stream_id);
     env.storage().persistent().set(&key, info);
 }
 
+/// Bump the TTL of a stream's persistent entry to roughly 30 days.
+///
+/// Should be called after any read/write to keep frequently used streams from
+/// being archived by the network's storage GC.
 pub fn extend_stream_ttl(env: &Env, stream_id: u32) {
     let key = stream_key(env, stream_id);
     env.storage()
