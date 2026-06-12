@@ -156,14 +156,28 @@ See [docs/RELEASE.md](docs/RELEASE.md) for the full release process, including h
 ```
 streampay-contracts/
 ├── src/
-│   └── lib.rs                        # Contract and tests
+│   ├── lib.rs                        # Contract entry points and tests
+│   └── stream.rs                     # StreamInfo and storage helpers
 ├── docker/
 │   └── Dockerfile.build              # Deterministic WASM builder
 ├── .github/workflows/
 │   ├── ci.yml                        # Format, build, test
 │   └── release.yml                   # Tagged release workflow
 ├── docs/
-│   └── RELEASE.md                    # Release process guide
+│   ├── RELEASE.md                    # Release process guide
+│   ├── architecture-overview.md      # Crate layout map
+│   ├── error-codes.md                # Panic string reference
+│   ├── glossary.md                   # Streaming terminology
+│   ├── local-development.md          # Contributor environment setup
+│   └── ...                           # Plus design specs per feature
+├── scripts/
+│   ├── build.sh                      # Release WASM build
+│   ├── test.sh                       # Test suite with testutils feature
+│   ├── fmt-check.sh                  # rustfmt CI mirror
+│   ├── deny.sh                       # cargo-deny wrapper
+│   ├── clean.sh                      # Drop target/ and artifacts/
+│   ├── wasm-hash.sh                  # SHA-256 of release wasm
+│   └── check-wasm-size.sh            # WASM size guard
 ├── cliff.toml                        # Changelog generator config
 ├── rust-toolchain.toml               # Pinned Rust version
 ├── Cargo.toml
