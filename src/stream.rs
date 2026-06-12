@@ -5,15 +5,26 @@ pub const STREAM_TTL_THRESHOLD: u32 = 17_280;
 /// TTL extend-to: refresh to ~30 days (518_400 ledgers).
 pub const STREAM_TTL_EXTEND: u32 = 518_400;
 
+/// On-chain representation of a payment stream.
+///
+/// Stored under `("stream", stream_id)` in persistent storage. All time fields
+/// are Unix seconds derived from `Env::ledger().timestamp()`.
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct StreamInfo {
+    /// Account that funded the stream and retains ownership of the escrowed balance.
     pub payer: Address,
+    /// Account entitled to receive accrued tokens once they are settled.
     pub recipient: Address,
+    /// Tokens streamed per whole second. Must be strictly positive at creation.
     pub rate_per_second: i128,
+    /// Tokens still held in escrow for this stream (not yet earned).
     pub balance: i128,
+    /// Unix seconds when the stream was started; `0` means it has not started yet.
     pub start_time: u64,
+    /// Unix seconds when accrual stops; `0` means "no time limit".
     pub end_time: u64,
+    /// Whether the stream is currently accruing. Toggled by start/stop.
     pub is_active: bool,
 }
 
