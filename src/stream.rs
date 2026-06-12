@@ -1,3 +1,17 @@
+//! Stream storage primitives.
+//!
+//! This module owns the on-chain shape of a single `StreamInfo` record and
+//! the small set of helpers used by `lib.rs` to read, write and bump the TTL
+//! on that record. Keeping the storage layer here makes the entry-point
+//! contract in `lib.rs` easier to read and audit.
+//!
+//! Storage layout:
+//!
+//! - Persistent: `("stream", stream_id) -> StreamInfo`
+//!
+//! See `docs/storage-layout.md` for the full layout including the instance
+//! counter and event topics.
+
 use soroban_sdk::{contracttype, Address, Env, Symbol};
 
 /// TTL threshold: extend when remaining TTL drops below ~1 day (17_280 ledgers at ~5s each).
