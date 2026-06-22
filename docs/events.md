@@ -18,6 +18,8 @@ symbol is the constant `"stream"`; the second is the action name.
 | `(stream, settled)` | `settle_stream` | `(stream_id, amount, new_balance, new_claimable)` |
 | `(stream, withdrawn)` | `withdraw_stream` | `(stream_id, recipient, amount)` |
 | `(stream, archived)` | `archive_stream` | `(stream_id, payer)` |
+| `(stream, paused)` | `pause_stream` | `(stream_id, pause_time)` |
+| `(stream, resumed)` | `resume_stream` | `(stream_id, resume_time)` |
 
 ## Field notes
 
@@ -30,6 +32,8 @@ symbol is the constant `"stream"`; the second is the action name.
 - Maintain `(stream_id -> running_total_claimed)` by summing `withdrawn`
   amounts; never sum `settled` amounts, since settlements may be batched
   and overlap with the same withdrawal window.
+- Track `claimable_balance` from settled/withdrawn events if the indexer needs
+  pending recipient withdrawals.
 - Use `(stream, archived)` as the signal to delete the stream from your
   active index. Once observed, no further events for that id can occur.
 - Topic ordering inside a single transaction is deterministic and matches

@@ -2,10 +2,21 @@
 
 **Document:** `docs/accrual-spec.md`  
 **Contract:** `StreamPay-Contracts` (Soroban / Rust)  
-**Version:** 0.1.0 (`VERSION = 1_000`)  
+**Version:** 0.2.0 (`VERSION = 2_000`)
 **Status:** Normative — matches `src/lib.rs` line-by-line
 
 ---
+
+## Current implementation note
+
+This document now tracks the current `src/lib.rs` surface: `VERSION = 2_000`,
+pause/resume entrypoints, SEP-41 token custody on creation and withdrawal, and
+the `claimable_balance` settlement model. `settle_stream` moves accrued value
+from `balance` into `claimable_balance`; `withdraw_stream` performs the
+recipient-authorized on-ledger transfer and resets claimable funds to zero.
+
+Linear vesting streams are covered separately in
+[`vesting-spec.md`](./vesting-spec.md).
 
 ## 1. Overview
 

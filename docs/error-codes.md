@@ -12,10 +12,17 @@ and what each one means for an integrator.
 | `memo exceeds 32 chars` | `create_stream` | The optional memo string is longer than 32 bytes. |
 | `stream already active` | `start_stream` | Trying to start a stream whose `is_active` flag is already true. |
 | `stream not active` | `stop_stream` | Trying to stop a stream that is already stopped. |
-| `unauthorized stopper` | `stop_stream` | The caller is neither the payer nor a recipient with `recipient_can_stop = true`. |
+| `cannot cancel inactive stream` | `cancel_stream` | The payer attempted to cancel a stream that is not active. |
+| `cannot pause inactive stream` | `pause_stream` | The payer attempted to pause a stream that is not active. |
+| `stream already paused` | `pause_stream` | The stream is already paused. |
+| `cannot resume inactive stream` | `resume_stream` | The payer attempted to resume a stream that is not active. |
+| `stream is not paused` | `resume_stream` | The stream is active and not currently paused. |
 | `batch too large` | `batch_settle` | Caller passed more than `MAX_BATCH_SETTLE_SIZE` (25) ids. |
-| `stream still has balance` | `archive_stream` | Balance is not fully settled and withdrawn. |
-| `stream still active` | `archive_stream` | Stream is still active; stop it first. |
+| `cannot archive active stream` | `archive_stream` | Stream is still active; stop it first. |
+| `cannot archive stream with unsettled balance` | `archive_stream` | Balance is not fully settled. |
+| `cannot archive stream with unclaimed balance` | `archive_stream` | Recipient still has claimable balance to withdraw. |
+| `rate must be positive` | `create_vesting_stream` | Vesting duration or rate configuration would create a non-positive stream rate. |
+| `rate increase exceeds 10% limit` | rate update flow | Requested rate increase exceeds the contract safety bound. |
 
 ## Why panic strings instead of error enums?
 
