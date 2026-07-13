@@ -30,6 +30,7 @@ external visitors to find the right entry point.
 | Doc | Summary |
 |---|---|
 | [`accrual-spec.md`](accrual-spec.md) | Continuous accrual math and rounding. |
+| [`vesting-spec.md`](vesting-spec.md) | Linear vesting formula, anchoring, and rounding. |
 | [`cancellation.md`](cancellation.md) | Stream cancellation behavior. |
 | [`collateral.md`](collateral.md) | Collateralization model. |
 | [`disputes.md`](disputes.md) | Dispute resolution flow. |
