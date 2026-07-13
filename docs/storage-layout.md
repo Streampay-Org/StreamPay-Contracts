@@ -67,13 +67,20 @@ existed or has been archived.
 
 ```rust
 pub struct StreamInfo {
-    pub payer:           Address,  // account that funded the stream; authorises mutations
-    pub recipient:       Address,  // beneficiary of streamed funds
-    pub rate_per_second: i128,     // tokens streamed per second (must be > 0)
-    pub balance:         i128,     // remaining unstreamed balance (must be > 0 at creation)
-    pub start_time:      u64,      // ledger timestamp when stream was last started/settled
-    pub end_time:        u64,      // ledger timestamp when stream was stopped (0 if never stopped)
-    pub is_active:       bool,     // true while the stream is running
+    pub schema_version:    u32,     // storage schema sentinel
+    pub payer:             Address,  // account that funded the stream; authorises mutations
+    pub recipient:         Address,  // beneficiary of streamed funds
+    pub token:             Address,  // SEP-41 token contract
+    pub rate_per_second:   i128,     // tokens streamed per second (linear mode)
+    pub balance:           i128,     // remaining unstreamed balance
+    pub claimable_balance: i128,     // earned but not yet withdrawn
+    pub start_time:        u64,      // ledger timestamp when stream was last started/settled
+    pub end_time:          u64,      // stop timestamp or optional auto-terminate time
+    pub is_active:         bool,     // true while the stream is running
+    pub paused_at:         u64,      // pause timestamp (0 if not paused)
+    pub memo:              String,   // immutable off-chain correlation string
+    pub recipient_can_stop: bool,    // recipient may call stop_stream
+    pub mode:              StreamMode, // Linear or LinearVesting
 }
 ```
 
