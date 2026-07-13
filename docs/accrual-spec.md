@@ -2,7 +2,7 @@
 
 **Document:** `docs/accrual-spec.md`  
 **Contract:** `StreamPay-Contracts` (Soroban / Rust)  
-**Version:** 0.1.0 (`VERSION = 1_000`)  
+**Version:** 0.2.0 (`VERSION = 2_000`)  
 **Status:** Normative — matches `src/lib.rs` line-by-line
 
 ---
@@ -12,8 +12,13 @@
 A StreamPay stream is a continuous payment channel that accrues value from a
 `payer` to a `recipient` at a fixed `rate_per_second` (in the smallest token
 unit, e.g. stroops). Accrual begins when the stream is **started** and is
-realised on each call to `settle_stream`. The contract is intentionally minimal:
-no pauses, no cliffs, pure linear accrual capped by the deposited balance.
+realised on each call to `settle_stream`, which moves earned tokens into
+`claimable_balance`. The recipient later calls `withdraw_stream` to perform the
+on-ledger SEP-41 transfer.
+
+v0.2.0 also supports `pause_stream` / `resume_stream`, optional `end_time`
+auto-termination, and `StreamMode::LinearVesting` schedules (see
+[`vesting-spec.md`](vesting-spec.md)).
 
 ---
 
@@ -23,13 +28,20 @@ Each stream stores the following fields (see `StreamInfo`):
 
 | Field | Type | Description |
 |---|---|---|
+| `schema_version` | `u32` | Storage schema sentinel (see `schema-versioning.md`) |
 | `payer` | `Address` | Account that funds the stream and controls it |
 | `recipient` | `Address` | Beneficiary of the streamed payments |
-| `rate_per_second` | `i128` | Token units accrued per second; must be > 0 |
-| `balance` | `i128` | Remaining deposited balance; must be > 0 at creation |
+| `token` | `Address` | SEP-41 token contract escrowed for this stream |
+| `rate_per_second` | `i128` | Token units accrued per second; must be > 0 for linear streams |
+| `balance` | `i128` | Remaining deposited balance; not yet earned |
+| `claimable_balance` | `i128` | Tokens earned but not yet withdrawn on-ledger |
 | `start_time` | `u64` | Ledger timestamp (seconds) of the last start or settle |
-| `end_time` | `u64` | Ledger timestamp (seconds) when the stream was stopped |
+| `end_time` | `u64` | Stop timestamp, or optional auto-terminate time (`0` = none) |
 | `is_active` | `bool` | `true` iff the stream is currently streaming |
+| `paused_at` | `u64` | Pause timestamp (`0` when not paused) |
+| `memo` | `String` | Immutable off-chain correlation string (max 32 bytes) |
+| `recipient_can_stop` | `bool` | Whether the recipient may call `stop_stream` |
+| `mode` | `StreamMode` | `Linear` or `LinearVesting { ... }` |
 
 > **Note on `start_time` semantics.** After each `settle_stream` call,
 > `start_time` is **reset to `now`**. It therefore represents the beginning of
@@ -100,15 +112,17 @@ in the same token-unit as `rate_per_second` and `balance`.
 `settle_stream` applies the formula and mutates state atomically:
 
 ```
-balance'    = balance − accrued
-start_time' = now
+balance'           = balance − accrued
+claimable_balance' = claimable_balance + accrued
+start_time'        = now
 ```
 
-In Rust (from `settle_stream`):
+In Rust (from `settle_stream_amount`):
 
 ```rust
-info.balance = info.balance.saturating_sub(amount);
-info.start_time = now;
+info.balance = info.balance.saturating_sub(accrued);
+info.claimable_balance = info.claimable_balance.saturating_add(accrued);
+info.start_time = settle_until;
 ```
 
 `saturating_sub` is used for safety; given the cap in §3.3 it can never
@@ -222,15 +236,9 @@ Settlement 4: start_time=30, now=40  → accrued=min(100,0)=0,    balance=0
 
 ## 8. What This Spec Does NOT Cover
 
-The current implementation (`v0.1.0`) deliberately omits:
-
-- **Pauses** — there is no pause/resume mechanism; `stop_stream` is terminal
-  until a new `start_stream` call.
 - **Cliffs** — accrual begins immediately from `start_time`; no cliff period.
-- **Token transfers** — `settle_stream` updates the on-chain balance field but
-  does not invoke a token contract transfer. Actual disbursement is handled at
-  the application layer.
-- **Multi-asset streams** — a single stream carries a single implicit asset.
+- **Linear vesting** — see [`vesting-spec.md`](vesting-spec.md).
+- **Multi-asset streams** — a single stream carries one SEP-41 token.
 
 ---
 
@@ -238,4 +246,5 @@ The current implementation (`v0.1.0`) deliberately omits:
 
 | Version | Change |
 |---|---|
-| 0.1.0 | Initial specification; linear accrual, no pauses or cliffs |
+| 0.2.0 | Added `claimable_balance`, SEP-41 transfers, pause/resume, vesting mode |
+| 0.1.0 | Initial specification; linear accrual only |

@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Consolidate canonical `StreamInfo` in `src/stream.rs` with SEP-41 `token`,
+  `claimable_balance`, `paused_at`, `memo`, `recipient_can_stop`, and `mode`.
+- `settle_stream_amount` helper centralising accrual logic for `settle_stream`
+  and `batch_settle`.
+- `create_vesting_stream` with `StreamMode::LinearVesting`.
+- `accrued_amount` read-only view.
+- Edge-case accrual tests (saturation, balance cap, zero elapsed).
+- Security regression tests for `withdraw_stream` CEI ordering and `update_rate`
+  compounding policy.
+- `docs/vesting-spec.md`.
+
+### Changed
+
+- Bump `STREAM_SCHEMA_VERSION` to `2`.
+- Reconcile `docs/accrual-spec.md`, `docs/events.md`, `docs/error-codes.md`,
+  and README contract-interface section with v0.2.0 implementation.
+
 ### Documentation
 
 - Add developer scripts (`build.sh`, `test.sh`, `fmt-check.sh`, `deny.sh`,
