@@ -30,12 +30,13 @@ Every `StreamInfo` entry carries a `schema_version: u32` field set to the
 
 ```rust
 /// Bump this whenever StreamInfo fields change.
-const STREAM_SCHEMA_VERSION: u32 = 1;
+const STREAM_SCHEMA_VERSION: u32 = 2;
 ```
 
 | Version | Fields present |
 |---------|----------------|
 | 1       | `schema_version`, `payer`, `recipient`, `rate_per_second`, `balance`, `start_time`, `end_time`, `is_active` |
+| 2       | v1 fields plus `token`, `claimable_balance`, `paused_at`, `memo`, `recipient_can_stop`, `mode` |
 
 Reading code can compare `info.schema_version` against `STREAM_SCHEMA_VERSION`
 to detect stale entries and decide whether migration is required before
