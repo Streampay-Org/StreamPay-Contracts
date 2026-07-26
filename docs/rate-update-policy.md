@@ -102,8 +102,9 @@ When updating the rate of an **inactive** stream:
 
 Payers can update rates multiple times:
 - Each update is evaluated against the **current** rate, not the original
-- Example: 1000/s → 500/s → 250/s → 275/s (all valid)
-- The 10% limit applies to each individual change
+- Example: 100/s → 110/s → 121/s (all valid — 10% compounding per call)
+- The 10% limit applies to each individual change, so N successive increases
+  compound multiplicatively (`1.10^N` relative to the starting rate of the chain)
 
 ### Rate Update During Settlement Window
 
