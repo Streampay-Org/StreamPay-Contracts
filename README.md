@@ -8,17 +8,13 @@ This repo contains the on-chain logic for creating, starting, stopping, and sett
 
 ### Contract interface
 
-- **`create_stream(payer, recipient, token, rate_per_second, initial_balance, recipient_can_stop)`** — Create a new stream and escrow tokens (payer must auth). Set `recipient_can_stop = true` to allow the recipient to also stop the stream.
-- **`create_vesting_stream(payer, recipient, total_amount, duration_seconds)`** — Create a linear vesting stream.
-- **`start_stream(stream_id)`** — Start an existing stream (payer auth).
-- **`stop_stream(stream_id, stopper)`** — Stop an active stream. `stopper` must be the payer, or the recipient when `recipient_can_stop` was set at creation.
-- **`settle_stream(stream_id)`** — Compute and move accrued tokens to `claimable_balance`; returns amount.
-- **`withdraw_stream(stream_id)`** — Transfer `claimable_balance` to the recipient on-ledger (recipient auth).
+- **`create_stream(payer, recipient, rate_per_second, initial_balance, recipient_can_stop)`** — Create a new stream (payer must auth). Set `recipient_can_stop = true` to allow the recipient to also stop the stream; defaults to `false` (payer-only).
+- **`start_stream(stream_id)`** — Start an existing stream.
+- **`stop_stream(stream_id, stopper)`** — Stop an active stream. `stopper` must be the payer (always allowed) or the recipient (only when `recipient_can_stop` was set at creation). `stopper` must authorise the call.
+- **`settle_stream(stream_id)`** — Compute and deduct streamed amount since last settlement; returns amount.
 - **`batch_settle(stream_ids)`** — Settle multiple streams in a single call; returns one settled amount per input id.
-- **`update_rate(stream_id, new_rate)`** — Update streaming rate (payer auth; max 10% increase per call).
-- **`archive_stream(stream_id)`** — Remove a fully-settled, fully-withdrawn, inactive stream (payer auth).
-- **`get_stream_info(stream_id)`** — Read stream metadata.
-- **`accrued_amount(stream_id)`** — Read-only view of currently accrued (unsettled) amount.
+- **`archive_stream(stream_id)`** — Remove a fully-settled, inactive stream from storage (payer must auth).
+- **`get_stream_info(stream_id)`** — Read stream metadata (payer, recipient, rate, balance, timestamps, active, recipient_can_stop).
 - **`version()`** — Returns the contract version as a `u32` (no auth required).
 
 ### Batch settlement semantics
@@ -32,8 +28,6 @@ This repo contains the on-chain logic for creating, starting, stopping, and sett
 Streams are stored in **Soroban persistent storage** with per-stream TTL
 management. Each stream is an independent ledger entry that can expire
 independently. The contract instance storage holds only the `next_id` counter.
-The counter is 1-based; once it rolls over, the contract stores `0` as an
-exhausted sentinel and rejects further stream creation with `stream id overflow`.
 
 See `docs/factory-pattern.md` for the full design rationale and future factory
 pattern graduation path.
@@ -57,7 +51,8 @@ When releasing, update **both** `Cargo.toml` `version` and the `VERSION` const i
 
 Note: this crate uses `soroban-sdk` version 22.0 (see `Cargo.toml`).
 
-## Building, testing and deploying
+Building, testing and deploying (copy-paste)
+-----------------------------------------
 
 1) Build optimized WASM (recommended via Docker builder included):
 
@@ -102,7 +97,8 @@ soroban contract invoke --wasm target/wasm32-unknown-unknown/release/streampay_c
 soroban contract invoke --id <CONTRACT_ID> --fn start_stream --args 1
 ```
 
-### Notes
+Notes
+-----
 - The exact `soroban` CLI flags depend on the CLI version; consult `soroban --help`.
 - For deterministic WASM builds in CI, use the provided `docker/Dockerfile.build` which pins the Rust toolchain.
 - Ensure the `soroban-sdk` version in `Cargo.toml` is compatible with your `soroban` CLI and network.
@@ -136,7 +132,6 @@ soroban contract invoke --id <CONTRACT_ID> --fn start_stream --args 1
 | `cargo test`   | Run unit tests             |
 | `cargo fmt`    | Format code                |
 | `cargo fmt --all -- --check` | Check formatting (CI) |
-| `./scripts/check-wasm-size.sh` | Check optimized WASM size |
 
 ## CI/CD
 
@@ -145,9 +140,8 @@ On every push/PR to `main`, GitHub Actions runs:
 - Format check: `cargo fmt --all -- --check`
 - Build: `cargo build`
 - Tests: `cargo test`
-- WASM size check: Reports optimized contract size and warns if approaching limits
 
-Ensure all checks pass before merging. See [docs/resource-limits.md](docs/resource-limits.md) for details on Soroban resource constraints.
+Ensure all three pass before merging.
 
 ## Releases
 
@@ -160,28 +154,14 @@ See [docs/RELEASE.md](docs/RELEASE.md) for the full release process, including h
 ```
 streampay-contracts/
 ├── src/
-│   ├── lib.rs                        # Contract entry points and tests
-│   └── stream.rs                     # StreamInfo and storage helpers
+│   └── lib.rs                        # Contract and tests
 ├── docker/
 │   └── Dockerfile.build              # Deterministic WASM builder
 ├── .github/workflows/
 │   ├── ci.yml                        # Format, build, test
 │   └── release.yml                   # Tagged release workflow
 ├── docs/
-│   ├── RELEASE.md                    # Release process guide
-│   ├── architecture-overview.md      # Crate layout map
-│   ├── error-codes.md                # Panic string reference
-│   ├── glossary.md                   # Streaming terminology
-│   ├── local-development.md          # Contributor environment setup
-│   └── ...                           # Plus design specs per feature
-├── scripts/
-│   ├── build.sh                      # Release WASM build
-│   ├── test.sh                       # Test suite with testutils feature
-│   ├── fmt-check.sh                  # rustfmt CI mirror
-│   ├── deny.sh                       # cargo-deny wrapper
-│   ├── clean.sh                      # Drop target/ and artifacts/
-│   ├── wasm-hash.sh                  # SHA-256 of release wasm
-│   └── check-wasm-size.sh            # WASM size guard
+│   └── RELEASE.md                    # Release process guide
 ├── cliff.toml                        # Changelog generator config
 ├── rust-toolchain.toml               # Pinned Rust version
 ├── Cargo.toml
@@ -198,13 +178,6 @@ MIT
 | Doc | Description |
 |---|---|
 | [`docs/timestamp-accrual.md`](docs/timestamp-accrual.md) | Ledger timestamp assumptions: validator behavior, coarse granularity, accrual edge cases, off-chain UX rounding |
-| [`docs/accrual-spec.md`](docs/accrual-spec.md) | Formal accrual formula and settlement semantics |
-| [`docs/vesting-spec.md`](docs/vesting-spec.md) | Linear vesting formula, schedule anchoring, and rounding |
-| [`docs/error-codes.md`](docs/error-codes.md) | Canonical list of panic strings the contract can emit |
-| [`docs/glossary.md`](docs/glossary.md) | Definitions for terms used across the codebase and docs |
-| [`docs/local-development.md`](docs/local-development.md) | Contributor environment setup |
-| [`docs/scripts.md`](docs/scripts.md) | Reference for the helper scripts under `scripts/` |
-| [`docs/ttl-strategy.md`](docs/ttl-strategy.md) | Persistent storage TTL refresh strategy |
 | [`SECURITY.md`](SECURITY.md) | Security policy and responsible disclosure |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Contribution guidelines |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release history |

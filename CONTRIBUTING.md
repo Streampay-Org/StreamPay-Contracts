@@ -6,9 +6,6 @@ This repository contains the `streampay-contracts` Soroban smart contract crate.
 
 ## Quick start
 
-The fast path: `git clone`, `cargo build`, `cargo test`. See the workflow
-below for the steps reviewers expect when you open a PR.
-
 ## Workflow
 
 1. Fork the repository (or create a branch if you have write access).
@@ -108,11 +105,11 @@ When opening a PR:
 
 ## Timelines
 
-If you're assigned an issue, aim to open a draft PR or progress update within **96 hours** so others know it's actively being worked on.
+If you’re assigned an issue, aim to open a draft PR or progress update within **96 hours** so others know it’s actively being worked on.
 
 ## Security
 
-If you believe you've found a vulnerability, please **do not** open a public issue. See `SECURITY.md`.
+If you believe you’ve found a vulnerability, please **do not** open a public issue. See `SECURITY.md`.
 
 ## Coverage guideline
 

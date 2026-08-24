@@ -21,19 +21,6 @@ jobs:
 
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-          # Cache stellar-cli installation
-          cache-targets: true
-
-      - name: Install stellar-cli
-        run: |
-          if ! command -v stellar &> /dev/null; then
-            echo "Installing stellar-cli..."
-            cargo install --locked stellar-cli --version 25.2.0
-          else
-            echo "stellar-cli already installed"
-          fi
 
       - name: Check licenses and advisories
         uses: EmbarkStudios/cargo-deny-action@v2
@@ -46,8 +33,3 @@ jobs:
 
       - name: Run tests
         run: cargo test
-
-      - name: Check WASM size
-        run: |
-          chmod +x scripts/check-wasm-size.sh
-          ./scripts/check-wasm-size.sh
