@@ -178,16 +178,15 @@ impl StreamPayContract {
         extend_instance_ttl(&env);
     }
 
-    /// Stop an active stream.
+    /// Stop an active stream, atomically settling its exact earned amount.
     pub fn stop_stream(env: Env, stream_id: u32) {
         let mut info = get_stream(&env, stream_id);
         info.payer.require_auth();
         if !info.is_active {
             panic!("stream not active");
         }
-        info.is_active = false;
-        info.end_time = env.ledger().timestamp();
-        info.paused_at = 0; // Clear paused state
+
+        terminalize_stream(&mut info, env.ledger().timestamp());
         set_stream(&env, stream_id, &info);
         extend_stream_ttl(&env, stream_id);
         extend_instance_ttl(&env);
@@ -277,22 +276,7 @@ impl StreamPayContract {
             panic!("cannot cancel inactive stream");
         }
 
-        let now = env.ledger().timestamp();
-        let terminal_boundary = end_bound(now, info.end_time);
-        let boundary = accrual_bound(now, info.end_time, info.paused_at);
-
-        // Settle accrued amount up to the effective accrual boundary.
-        let elapsed = boundary.saturating_sub(info.start_time);
-        let accrued = (elapsed as i128)
-            .saturating_mul(info.rate_per_second)
-            .min(info.balance);
-
-        // Deduct accrued from balance (paid to recipient)
-        info.balance = info.balance.saturating_sub(accrued);
-        info.start_time = boundary;
-        info.is_active = false;
-        info.end_time = terminal_boundary; // Mark terminal boundary
-        info.paused_at = 0;
+        terminalize_stream(&mut info, env.ledger().timestamp());
 
         set_stream(&env, stream_id, &info);
         extend_stream_ttl(&env, stream_id);
@@ -318,12 +302,7 @@ impl StreamPayContract {
         let boundary = accrual_bound(now, info.end_time, info.paused_at);
 
         // Settle accrued amount up to the end-capped pause point.
-        let elapsed = boundary.saturating_sub(info.start_time);
-        let accrued = (elapsed as i128)
-            .saturating_mul(info.rate_per_second)
-            .min(info.balance);
-        info.balance = info.balance.saturating_sub(accrued);
-        info.start_time = boundary;
+        settle_info_to_boundary(&mut info, boundary);
 
         if reached_natural_end(now, info.end_time) {
             info.is_active = false;
@@ -462,12 +441,7 @@ fn settle_stream_amount(env: &Env, stream_id: u32) -> Option<i128> {
 
     let now = env.ledger().timestamp();
     let settlement_time = accrual_bound(now, info.end_time, info.paused_at);
-    let elapsed = settlement_time.saturating_sub(info.start_time);
-    let amount = (elapsed as i128)
-        .saturating_mul(info.rate_per_second)
-        .min(info.balance);
-    info.balance = info.balance.saturating_sub(amount);
-    info.start_time = settlement_time;
+    let amount = settle_info_to_boundary(&mut info, settlement_time);
     if reached_natural_end(now, info.end_time) {
         // A bounded stream that reached its configured end is terminal:
         // further settlements must not move value.
@@ -501,6 +475,45 @@ fn accrual_bound(now: u64, end_time: u64, paused_at: u64) -> u64 {
     } else {
         boundary.min(paused_at)
     }
+}
+
+/// Cursor from which a value-moving operation may accrue.
+///
+/// Before the paused-accrual fix, `pause_stream` deducted value through
+/// `paused_at` without advancing `start_time`. Persisted paused streams from
+/// that implementation therefore use `paused_at` as their already-accounted
+/// cursor. Fresh states have `start_time == paused_at`, so the same rule is
+/// compatible with both shapes and prevents replaying the pre-pause interval.
+fn accrual_cursor(start_time: u64, paused_at: u64) -> u64 {
+    if paused_at == 0 {
+        start_time
+    } else {
+        start_time.max(paused_at)
+    }
+}
+
+/// Deduct the amount earned between the effective cursor and `boundary`, then
+/// persist the boundary as the new cursor so no later path can replay it.
+fn settle_info_to_boundary(info: &mut StreamInfo, boundary: u64) -> i128 {
+    let cursor = accrual_cursor(info.start_time, info.paused_at);
+    let elapsed = boundary.saturating_sub(cursor);
+    let amount = (elapsed as i128)
+        .saturating_mul(info.rate_per_second)
+        .min(info.balance);
+    info.balance = info.balance.saturating_sub(amount);
+    info.start_time = boundary;
+    amount
+}
+
+/// Settle through the same pause/end-aware boundary used by permissionless
+/// settlement, then make the stream terminal and clear stale pause state.
+fn terminalize_stream(info: &mut StreamInfo, now: u64) {
+    let terminal_boundary = end_bound(now, info.end_time);
+    let boundary = accrual_bound(now, info.end_time, info.paused_at);
+    settle_info_to_boundary(info, boundary);
+    info.is_active = false;
+    info.end_time = terminal_boundary;
+    info.paused_at = 0;
 }
 
 /// Whether a bounded stream has reached its configured natural end by

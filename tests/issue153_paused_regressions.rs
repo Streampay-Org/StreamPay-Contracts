@@ -1,7 +1,7 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use soroban_sdk::testutils::{Address as _, Ledger as _};
-use soroban_sdk::{Address, Env, Vec as SorobanVec};
+use soroban_sdk::{Address, Env, Symbol, Vec as SorobanVec};
 use streampay_contracts::{StreamInfo, StreamPayContract, StreamPayContractClient};
 
 fn setup<'a>(
@@ -26,6 +26,35 @@ fn at(env: &Env, timestamp: u64) {
 
 fn snapshot(client: &StreamPayContractClient<'_>, stream_id: u32) -> StreamInfo {
     client.get_stream_info(&stream_id)
+}
+
+/// Reproduce the persisted shape written by the pre-fix pause implementation:
+/// the pause interval was already deducted from `balance`, but `start_time`
+/// remained at the pre-pause cursor while `paused_at` recorded the boundary.
+fn setup_legacy_paused<'a>(env: &'a Env) -> (StreamPayContractClient<'a>, u32) {
+    env.mock_all_auths();
+    let contract_id = env.register(StreamPayContract, ());
+    let client = StreamPayContractClient::new(env, &contract_id);
+    let payer = Address::generate(env);
+    let recipient = Address::generate(env);
+    let stream_id = client.create_stream(&payer, &recipient, &1, &10, &10);
+    client.start_stream(&stream_id);
+
+    at(env, 2);
+    client.pause_stream(&stream_id);
+    let mut legacy = snapshot(&client, stream_id);
+    assert_eq!(legacy.balance, 8);
+    assert_eq!(legacy.start_time, 2);
+    assert_eq!(legacy.paused_at, 2);
+
+    legacy.start_time = 0;
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .set(&(Symbol::new(env, "stream"), stream_id), &legacy);
+    });
+
+    (client, stream_id)
 }
 
 #[test]
@@ -360,4 +389,99 @@ fn issue153_red_late_pause_with_small_balance_preserves_unearned_value() {
     assert_eq!(info.balance, 5);
     assert!(!info.is_active);
     assert_eq!(info.paused_at, 0);
+}
+
+#[test]
+fn issue153_red_legacy_paused_settle_does_not_repay_preupgrade_interval() {
+    let env = Env::default();
+    let (client, stream_id) = setup_legacy_paused(&env);
+
+    at(&env, 3);
+    let amount = client.settle_stream(&stream_id);
+    let info = snapshot(&client, stream_id);
+
+    assert_eq!(amount, 0, "the legacy pause already paid [0,2]");
+    assert_eq!(info.balance, 8, "settle must preserve unearned custody");
+    assert_eq!(info.start_time, 2, "settle must normalize the old cursor");
+    assert_eq!(info.paused_at, 2);
+    assert!(info.is_active);
+}
+
+#[test]
+fn issue153_red_legacy_paused_batch_does_not_repay_preupgrade_interval() {
+    let env = Env::default();
+    let (client, stream_id) = setup_legacy_paused(&env);
+
+    at(&env, 3);
+    let mut ids = SorobanVec::new(&env);
+    ids.push_back(stream_id);
+    let amounts = client.batch_settle(&ids);
+    let info = snapshot(&client, stream_id);
+
+    assert_eq!(amounts.get(0).unwrap(), 0);
+    assert_eq!(info.balance, 8, "batch must preserve unearned custody");
+    assert_eq!(info.start_time, 2, "batch must normalize the old cursor");
+    assert_eq!(info.paused_at, 2);
+    assert!(info.is_active);
+}
+
+#[test]
+fn issue153_red_legacy_paused_cancel_does_not_repay_preupgrade_interval() {
+    let env = Env::default();
+    let (client, stream_id) = setup_legacy_paused(&env);
+
+    at(&env, 3);
+    client.cancel_stream(&stream_id);
+    let info = snapshot(&client, stream_id);
+
+    assert_eq!(info.balance, 8, "cancel must preserve unearned custody");
+    assert_eq!(info.start_time, 2, "cancel must normalize the old cursor");
+    assert_eq!(info.end_time, 3);
+    assert_eq!(info.paused_at, 0);
+    assert!(!info.is_active);
+}
+
+#[test]
+fn issue153_red_stop_after_natural_end_settles_exact_entitlement() {
+    let env = Env::default();
+    let (client, stream_id) = setup(&env, 1, 100, 10);
+
+    at(&env, 11);
+    client.stop_stream(&stream_id);
+    let stopped = snapshot(&client, stream_id);
+
+    assert_eq!(stopped.balance, 90, "recipient earned exactly [0,10]");
+    assert_eq!(stopped.start_time, 10);
+    assert_eq!(stopped.end_time, 10, "natural end remains authoritative");
+    assert_eq!(stopped.paused_at, 0);
+    assert!(!stopped.is_active);
+
+    at(&env, 100);
+    assert_eq!(client.settle_stream(&stream_id), 0);
+    assert_eq!(snapshot(&client, stream_id).balance, 90);
+}
+
+#[test]
+fn issue153_red_partial_settle_then_stop_settles_only_new_interval() {
+    let env = Env::default();
+    let (client, stream_id) = setup(&env, 1, 100, 10);
+
+    at(&env, 2);
+    assert_eq!(client.settle_stream(&stream_id), 2);
+    at(&env, 3);
+    client.stop_stream(&stream_id);
+    let stopped = snapshot(&client, stream_id);
+
+    assert_eq!(
+        stopped.balance, 97,
+        "stop must settle the new [2,3] interval"
+    );
+    assert_eq!(stopped.start_time, 3);
+    assert_eq!(stopped.end_time, 3);
+    assert_eq!(stopped.paused_at, 0);
+    assert!(!stopped.is_active);
+
+    at(&env, 100);
+    assert_eq!(client.settle_stream(&stream_id), 0);
+    assert_eq!(snapshot(&client, stream_id).balance, 97);
 }
