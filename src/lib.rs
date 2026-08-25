@@ -278,9 +278,10 @@ impl StreamPayContract {
         }
 
         let now = env.ledger().timestamp();
-        let boundary = settlement_timestamp(now, info.end_time);
+        let terminal_boundary = end_bound(now, info.end_time);
+        let boundary = accrual_bound(now, info.end_time, info.paused_at);
 
-        // Settle accrued amount up to the effective terminal boundary.
+        // Settle accrued amount up to the effective accrual boundary.
         let elapsed = boundary.saturating_sub(info.start_time);
         let accrued = (elapsed as i128)
             .saturating_mul(info.rate_per_second)
@@ -288,8 +289,10 @@ impl StreamPayContract {
 
         // Deduct accrued from balance (paid to recipient)
         info.balance = info.balance.saturating_sub(accrued);
+        info.start_time = boundary;
         info.is_active = false;
-        info.end_time = boundary; // Mark terminal boundary
+        info.end_time = terminal_boundary; // Mark terminal boundary
+        info.paused_at = 0;
 
         set_stream(&env, stream_id, &info);
         extend_stream_ttl(&env, stream_id);
@@ -312,16 +315,23 @@ impl StreamPayContract {
         }
 
         let now = env.ledger().timestamp();
+        let boundary = accrual_bound(now, info.end_time, info.paused_at);
 
-        // Settle accrued amount up to pause point
-        let elapsed = now - info.start_time;
+        // Settle accrued amount up to the end-capped pause point.
+        let elapsed = boundary.saturating_sub(info.start_time);
         let accrued = (elapsed as i128)
             .saturating_mul(info.rate_per_second)
             .min(info.balance);
         info.balance = info.balance.saturating_sub(accrued);
+        info.start_time = boundary;
 
-        // Mark paused but keep is_active true (logical "paused" state)
-        info.paused_at = now;
+        if reached_natural_end(now, info.end_time) {
+            info.is_active = false;
+            info.paused_at = 0;
+        } else {
+            // Keep is_active true while paused so the stream can be resumed.
+            info.paused_at = boundary;
+        }
 
         set_stream(&env, stream_id, &info);
         extend_stream_ttl(&env, stream_id);
@@ -343,6 +353,17 @@ impl StreamPayContract {
         }
 
         let now = env.ledger().timestamp();
+
+        if reached_natural_end(now, info.end_time) {
+            // A stream whose configured schedule ended while paused is terminal.
+            // Resuming must never create a post-end accrual window.
+            info.is_active = false;
+            info.paused_at = 0;
+            set_stream(&env, stream_id, &info);
+            extend_stream_ttl(&env, stream_id);
+            extend_instance_ttl(&env);
+            return;
+        }
 
         // Resume: reset start_time to account for paused duration and clear paused state
         info.start_time = now;
@@ -440,7 +461,7 @@ fn settle_stream_amount(env: &Env, stream_id: u32) -> Option<i128> {
     }
 
     let now = env.ledger().timestamp();
-    let settlement_time = settlement_timestamp(now, info.end_time);
+    let settlement_time = accrual_bound(now, info.end_time, info.paused_at);
     let elapsed = settlement_time.saturating_sub(info.start_time);
     let amount = (elapsed as i128)
         .saturating_mul(info.rate_per_second)
@@ -451,6 +472,7 @@ fn settle_stream_amount(env: &Env, stream_id: u32) -> Option<i128> {
         // A bounded stream that reached its configured end is terminal:
         // further settlements must not move value.
         info.is_active = false;
+        info.paused_at = 0;
     }
     set_stream(env, stream_id, &info);
     extend_stream_ttl(env, stream_id);
@@ -463,11 +485,21 @@ fn settle_stream_amount(env: &Env, stream_id: u32) -> Option<i128> {
 /// Unlimited streams (`end_time == 0`) settle at the current ledger
 /// timestamp; bounded streams never accrue past their configured
 /// `end_time`, so the boundary is `min(now, end_time)`.
-fn settlement_timestamp(now: u64, end_time: u64) -> u64 {
+fn end_bound(now: u64, end_time: u64) -> u64 {
     if end_time != 0 && now > end_time {
         end_time
     } else {
         now
+    }
+}
+
+/// Effective accrual boundary, additionally capped at the pause timestamp.
+fn accrual_bound(now: u64, end_time: u64, paused_at: u64) -> u64 {
+    let boundary = end_bound(now, end_time);
+    if paused_at == 0 {
+        boundary
+    } else {
+        boundary.min(paused_at)
     }
 }
 
