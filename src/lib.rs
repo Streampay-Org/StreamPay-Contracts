@@ -178,16 +178,15 @@ impl StreamPayContract {
         extend_instance_ttl(&env);
     }
 
-    /// Stop an active stream.
+    /// Stop an active stream, atomically settling its exact earned amount.
     pub fn stop_stream(env: Env, stream_id: u32) {
         let mut info = get_stream(&env, stream_id);
         info.payer.require_auth();
         if !info.is_active {
             panic!("stream not active");
         }
-        info.is_active = false;
-        info.end_time = env.ledger().timestamp();
-        info.paused_at = 0; // Clear paused state
+
+        terminalize_stream(&mut info, env.ledger().timestamp());
         set_stream(&env, stream_id, &info);
         extend_stream_ttl(&env, stream_id);
         extend_instance_ttl(&env);
@@ -264,6 +263,11 @@ impl StreamPayContract {
     /// Immediately settles all accrued amounts to the recipient.
     /// Remaining unaccrued balance is retained by the payer.
     /// Atomic operation: prevents race conditions with settle.
+    ///
+    /// For a bounded stream the natural configured `end_time` takes
+    /// precedence over a late cancellation: accrual is capped at
+    /// `min(now, end_time)` and the stored terminal boundary stays the
+    /// configured end instead of moving forward to the cancellation time.
     pub fn cancel_stream(env: Env, stream_id: u32) {
         let mut info = get_stream(&env, stream_id);
         info.payer.require_auth();
@@ -272,18 +276,7 @@ impl StreamPayContract {
             panic!("cannot cancel inactive stream");
         }
 
-        let now = env.ledger().timestamp();
-
-        // Settle accrued amount up to cancellation
-        let elapsed = now - info.start_time;
-        let accrued = (elapsed as i128)
-            .saturating_mul(info.rate_per_second)
-            .min(info.balance);
-
-        // Deduct accrued from balance (paid to recipient)
-        info.balance = info.balance.saturating_sub(accrued);
-        info.is_active = false;
-        info.end_time = now; // Mark cancellation point
+        terminalize_stream(&mut info, env.ledger().timestamp());
 
         set_stream(&env, stream_id, &info);
         extend_stream_ttl(&env, stream_id);
@@ -306,16 +299,18 @@ impl StreamPayContract {
         }
 
         let now = env.ledger().timestamp();
+        let boundary = accrual_bound(now, info.end_time, info.paused_at);
 
-        // Settle accrued amount up to pause point
-        let elapsed = now - info.start_time;
-        let accrued = (elapsed as i128)
-            .saturating_mul(info.rate_per_second)
-            .min(info.balance);
-        info.balance = info.balance.saturating_sub(accrued);
+        // Settle accrued amount up to the end-capped pause point.
+        settle_info_to_boundary(&mut info, boundary);
 
-        // Mark paused but keep is_active true (logical "paused" state)
-        info.paused_at = now;
+        if reached_natural_end(now, info.end_time) {
+            info.is_active = false;
+            info.paused_at = 0;
+        } else {
+            // Keep is_active true while paused so the stream can be resumed.
+            info.paused_at = boundary;
+        }
 
         set_stream(&env, stream_id, &info);
         extend_stream_ttl(&env, stream_id);
@@ -337,6 +332,17 @@ impl StreamPayContract {
         }
 
         let now = env.ledger().timestamp();
+
+        if reached_natural_end(now, info.end_time) {
+            // A stream whose configured schedule ended while paused is terminal.
+            // Resuming must never create a post-end accrual window.
+            info.is_active = false;
+            info.paused_at = 0;
+            set_stream(&env, stream_id, &info);
+            extend_stream_ttl(&env, stream_id);
+            extend_instance_ttl(&env);
+            return;
+        }
 
         // Resume: reset start_time to account for paused duration and clear paused state
         info.start_time = now;
@@ -434,16 +440,86 @@ fn settle_stream_amount(env: &Env, stream_id: u32) -> Option<i128> {
     }
 
     let now = env.ledger().timestamp();
-    let elapsed = now - info.start_time;
-    let amount = (elapsed as i128)
-        .saturating_mul(info.rate_per_second)
-        .min(info.balance);
-    info.balance = info.balance.saturating_sub(amount);
-    info.start_time = now;
+    let settlement_time = accrual_bound(now, info.end_time, info.paused_at);
+    let amount = settle_info_to_boundary(&mut info, settlement_time);
+    if reached_natural_end(now, info.end_time) {
+        // A bounded stream that reached its configured end is terminal:
+        // further settlements must not move value.
+        info.is_active = false;
+        info.paused_at = 0;
+    }
     set_stream(env, stream_id, &info);
     extend_stream_ttl(env, stream_id);
 
     Some(amount)
+}
+
+/// Effective accrual boundary for a stream observed at ledger time `now`.
+///
+/// Unlimited streams (`end_time == 0`) settle at the current ledger
+/// timestamp; bounded streams never accrue past their configured
+/// `end_time`, so the boundary is `min(now, end_time)`.
+fn end_bound(now: u64, end_time: u64) -> u64 {
+    if end_time != 0 && now > end_time {
+        end_time
+    } else {
+        now
+    }
+}
+
+/// Effective accrual boundary, additionally capped at the pause timestamp.
+fn accrual_bound(now: u64, end_time: u64, paused_at: u64) -> u64 {
+    let boundary = end_bound(now, end_time);
+    if paused_at == 0 {
+        boundary
+    } else {
+        boundary.min(paused_at)
+    }
+}
+
+/// Cursor from which a value-moving operation may accrue.
+///
+/// Before the paused-accrual fix, `pause_stream` deducted value through
+/// `paused_at` without advancing `start_time`. Persisted paused streams from
+/// that implementation therefore use `paused_at` as their already-accounted
+/// cursor. Fresh states have `start_time == paused_at`, so the same rule is
+/// compatible with both shapes and prevents replaying the pre-pause interval.
+fn accrual_cursor(start_time: u64, paused_at: u64) -> u64 {
+    if paused_at == 0 {
+        start_time
+    } else {
+        start_time.max(paused_at)
+    }
+}
+
+/// Deduct the amount earned between the effective cursor and `boundary`, then
+/// persist the boundary as the new cursor so no later path can replay it.
+fn settle_info_to_boundary(info: &mut StreamInfo, boundary: u64) -> i128 {
+    let cursor = accrual_cursor(info.start_time, info.paused_at);
+    let elapsed = boundary.saturating_sub(cursor);
+    let amount = (elapsed as i128)
+        .saturating_mul(info.rate_per_second)
+        .min(info.balance);
+    info.balance = info.balance.saturating_sub(amount);
+    info.start_time = boundary;
+    amount
+}
+
+/// Settle through the same pause/end-aware boundary used by permissionless
+/// settlement, then make the stream terminal and clear stale pause state.
+fn terminalize_stream(info: &mut StreamInfo, now: u64) {
+    let terminal_boundary = end_bound(now, info.end_time);
+    let boundary = accrual_bound(now, info.end_time, info.paused_at);
+    settle_info_to_boundary(info, boundary);
+    info.is_active = false;
+    info.end_time = terminal_boundary;
+    info.paused_at = 0;
+}
+
+/// Whether a bounded stream has reached its configured natural end by
+/// ledger time `now`.
+fn reached_natural_end(now: u64, end_time: u64) -> bool {
+    end_time != 0 && now >= end_time
 }
 
 fn extend_stream_ttl(env: &Env, stream_id: u32) {
@@ -1112,6 +1188,277 @@ mod test {
         );
         let info = client.get_stream_info(&stream_id);
         assert_eq!(info.balance, 0);
+    }
+}
+
+/// Regression coverage for issue #153: cancellation and natural end-time
+/// settlement must be exact, deterministic, once-only, and capped at the
+/// configured `end_time` of bounded streams.
+///
+/// Boundary witnesses follow the ContractGraph-QA oracle for this issue:
+/// `T_before = end_time - 1`, `T_exact = end_time`, `T_after > end_time`.
+///
+/// Invariants:
+///   I1 — a temporal interval is paid at most once;
+///   I2 — accrual never passes the configured end time of a bounded stream;
+///   I3 — initial_balance = cumulative_settled + remaining_balance;
+///   I4 — reaching the natural end is terminal; repeated operations move
+///        no additional value;
+///   I5 — identical stored state plus ledger timestamp yields identical
+///        results;
+///   I6 — payer authorization and failure modes are preserved.
+#[cfg(test)]
+mod end_time_settlement_tests {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::Ledger as _;
+
+    use super::*;
+
+    /// Rate used by every scenario: 10 units per second.
+    const RATE: i128 = 10;
+    /// Initial deposited balance used by every scenario.
+    const BALANCE: i128 = 1_000;
+    /// Configured end_time for bounded streams (start is always t=0).
+    const END_TIME: u64 = 10;
+
+    fn setup(env: &Env, end_time: u64) -> (StreamPayContractClient<'_>, u32) {
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(env, &contract_id);
+        let payer = Address::generate(env);
+        let recipient = Address::generate(env);
+        let stream_id = client.create_stream(&payer, &recipient, &RATE, &BALANCE, &end_time);
+        client.start_stream(&stream_id);
+        (client, stream_id)
+    }
+
+    fn advance(env: &Env, seconds: u64) {
+        env.ledger().with_mut(|li| {
+            li.timestamp += seconds;
+        });
+    }
+
+    /// A settle strictly before the end pays through the witness and keeps
+    /// the stream active (control scenario).
+    #[test]
+    fn test_settle_before_end_accrues_through_now_and_stays_active() {
+        let env = Env::default();
+        let (client, stream_id) = setup(&env, END_TIME);
+
+        advance(&env, END_TIME - 1);
+        let amount = client.settle_stream(&stream_id);
+        assert_eq!(amount, 90, "I2: must pay exactly rate x (end-1)");
+
+        let info = client.get_stream_info(&stream_id);
+        assert!(info.is_active, "before the end the stream stays active");
+        assert_eq!(info.balance, BALANCE - 90);
+        assert_eq!(info.start_time, END_TIME - 1);
+    }
+
+    /// Settling exactly at the configured end pays the final interval and
+    /// makes the stream terminal.
+    #[test]
+    fn test_settle_exactly_at_end_is_final_and_terminal() {
+        let env = Env::default();
+        let (client, stream_id) = setup(&env, END_TIME);
+
+        advance(&env, END_TIME);
+        let amount = client.settle_stream(&stream_id);
+        assert_eq!(amount, RATE * END_TIME as i128);
+
+        let info = client.get_stream_info(&stream_id);
+        assert!(
+            !info.is_active,
+            "I4: settling at the natural end must make the stream terminal"
+        );
+        assert_eq!(info.balance, BALANCE - RATE * END_TIME as i128);
+    }
+
+    /// A settle invoked after the configured end must not accrue beyond it.
+    #[test]
+    fn test_settle_after_end_capped_at_configured_end_time() {
+        let env = Env::default();
+        let (client, stream_id) = setup(&env, END_TIME);
+
+        advance(&env, END_TIME + 10);
+        let amount = client.settle_stream(&stream_id);
+        assert_eq!(
+            amount,
+            RATE * END_TIME as i128,
+            "I2: accrual must be capped at the configured end_time"
+        );
+
+        let info = client.get_stream_info(&stream_id);
+        assert!(!info.is_active, "I4: late settle ends the stream");
+        assert_eq!(info.balance, BALANCE - RATE * END_TIME as i128);
+    }
+
+    /// Repeated settlement of a naturally ended stream moves no further
+    /// value regardless of how much time passes.
+    #[test]
+    fn test_repeated_settle_after_end_moves_no_value() {
+        let env = Env::default();
+        let (client, stream_id) = setup(&env, END_TIME);
+
+        advance(&env, END_TIME + 5);
+        let first = client.settle_stream(&stream_id);
+        assert_eq!(first, RATE * END_TIME as i128, "I2: capped at end_time");
+
+        advance(&env, 100);
+        let second = client.settle_stream(&stream_id);
+        assert_eq!(second, 0, "I4: terminal stream must not accrue again");
+
+        let info = client.get_stream_info(&stream_id);
+        assert_eq!(info.balance, BALANCE - RATE * END_TIME as i128);
+        assert!(!info.is_active);
+    }
+
+    /// Cancelling strictly before the end pays through the cancellation
+    /// witness, which becomes the stored terminal boundary.
+    #[test]
+    fn test_cancel_before_end_uses_cancellation_witness_as_boundary() {
+        let env = Env::default();
+        let (client, stream_id) = setup(&env, END_TIME);
+
+        advance(&env, END_TIME - 3);
+        client.cancel_stream(&stream_id);
+
+        let info = client.get_stream_info(&stream_id);
+        assert!(!info.is_active);
+        assert_eq!(info.balance, BALANCE - RATE * (END_TIME as i128 - 3));
+        assert_eq!(info.end_time, END_TIME - 3, "I5: boundary is deterministic");
+    }
+
+    /// Cancelling exactly at the end matches the natural-end economics.
+    #[test]
+    fn test_cancel_exactly_at_end_matches_natural_end_result() {
+        let env = Env::default();
+        let (client, stream_id) = setup(&env, END_TIME);
+
+        advance(&env, END_TIME);
+        client.cancel_stream(&stream_id);
+
+        let info = client.get_stream_info(&stream_id);
+        assert!(!info.is_active);
+        assert_eq!(info.balance, BALANCE - RATE * END_TIME as i128);
+        assert_eq!(info.end_time, END_TIME);
+    }
+
+    /// A cancellation invoked after the configured end must respect the
+    /// natural end: accrual is capped and the boundary does not move.
+    #[test]
+    fn test_cancel_after_end_natural_end_takes_precedence() {
+        let env = Env::default();
+        let (client, stream_id) = setup(&env, END_TIME);
+
+        advance(&env, END_TIME + 10);
+        client.cancel_stream(&stream_id);
+
+        let info = client.get_stream_info(&stream_id);
+        assert!(
+            !info.is_active,
+            "late cancellation of an ended stream is terminal"
+        );
+        assert_eq!(
+            info.balance,
+            BALANCE - RATE * END_TIME as i128,
+            "I2: no accrual past the configured end"
+        );
+        assert_eq!(
+            info.end_time, END_TIME,
+            "natural end wins over the late cancellation witness"
+        );
+    }
+
+    /// Once a stream reached its natural end, repeated terminal operations
+    /// cannot move value: extra settles are inert and cancel is rejected.
+    #[test]
+    fn test_terminal_operations_cannot_move_value_twice() {
+        let env = Env::default();
+        let (client, stream_id) = setup(&env, END_TIME);
+
+        advance(&env, END_TIME + 1);
+        assert_eq!(client.settle_stream(&stream_id), RATE * END_TIME as i128);
+        let settled_info = client.get_stream_info(&stream_id);
+
+        // Cancel after natural end must be rejected (failure mode preserved).
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            client.cancel_stream(&stream_id);
+        }));
+        assert!(result.is_err(), "cancelling a terminal stream must fail");
+
+        advance(&env, 50);
+        assert_eq!(
+            client.settle_stream(&stream_id),
+            0,
+            "I4: repeated settle after natural end moves nothing"
+        );
+
+        let info = client.get_stream_info(&stream_id);
+        assert_eq!(info.balance, settled_info.balance);
+        assert_eq!(info.start_time, settled_info.start_time);
+        assert!(!info.is_active);
+    }
+
+    /// Value conservation holds across every boundary scenario.
+    #[test]
+    fn test_value_conservation_across_boundary_scenarios() {
+        // settle before / at / after the end
+        for &(witness, expected_paid) in &[
+            (END_TIME - 1, RATE * (END_TIME as i128 - 1)),
+            (END_TIME, RATE * END_TIME as i128),
+            (END_TIME + 7, RATE * END_TIME as i128),
+        ] {
+            let env = Env::default();
+            let (client, stream_id) = setup(&env, END_TIME);
+            advance(&env, witness);
+            let paid = client.settle_stream(&stream_id);
+            assert_eq!(paid, expected_paid);
+            let info = client.get_stream_info(&stream_id);
+            assert_eq!(
+                paid + info.balance,
+                BALANCE,
+                "I3: settle at {witness} conserves value"
+            );
+        }
+
+        // cancel before / at / after the end
+        for witness in [END_TIME - 2, END_TIME, END_TIME + 9] {
+            let env = Env::default();
+            let (client, stream_id) = setup(&env, END_TIME);
+            advance(&env, witness);
+            client.cancel_stream(&stream_id);
+            let info = client.get_stream_info(&stream_id);
+            let paid = BALANCE - info.balance;
+            assert!(
+                paid <= RATE * END_TIME as i128,
+                "I2: cancel at {witness} must not exceed the end-time cap"
+            );
+            assert_eq!(
+                paid + info.balance,
+                BALANCE,
+                "I3: cancel at {witness} conserves value"
+            );
+        }
+    }
+
+    /// Unlimited streams keep accruing through the current ledger time.
+    #[test]
+    fn test_unlimited_stream_keeps_current_time_behavior() {
+        let env = Env::default();
+        let (client, stream_id) = setup(&env, 0);
+
+        advance(&env, 50);
+        assert_eq!(client.settle_stream(&stream_id), 500);
+        assert!(
+            client.get_stream_info(&stream_id).is_active,
+            "unlimited streams do not become terminal on settle"
+        );
+
+        advance(&env, 10);
+        assert_eq!(client.settle_stream(&stream_id), 100);
     }
 }
 
