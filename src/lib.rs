@@ -64,6 +64,9 @@
 //! 3. `new_balance >= 0` — `balance.saturating_sub(amount)` where `amount <=
 //!    balance` always yields a non-negative result.
 
+pub mod error;
+pub use error::{Error, ErrorCategory, ErrorSeverity, Recoverability};
+
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, Vec};
 
 /// Contract version: major * 1_000_000 + minor * 1_000 + patch.
@@ -127,7 +130,7 @@ impl StreamPayContract {
     ) -> u32 {
         payer.require_auth();
         if rate_per_second <= 0 || initial_balance <= 0 {
-            panic!("rate and balance must be positive");
+            panic!("{}", Error::RateAndBalanceMustBePositive.message());
         }
         let stream_id = get_next_stream_id(&env);
         let info = StreamInfo {
@@ -161,13 +164,13 @@ impl StreamPayContract {
         let mut info = get_stream(&env, stream_id);
         info.payer.require_auth();
         if info.is_active {
-            panic!("stream already active");
+            panic!("{}", Error::StreamAlreadyActive.message());
         }
         let now = env.ledger().timestamp();
 
         // Validate end_time constraint if set
         if info.end_time > 0 && info.end_time <= now {
-            panic!("end_time must be in the future");
+            panic!("{}", Error::EndTimeMustBeInFuture.message());
         }
 
         info.is_active = true;
@@ -183,7 +186,7 @@ impl StreamPayContract {
         let mut info = get_stream(&env, stream_id);
         info.payer.require_auth();
         if !info.is_active {
-            panic!("stream not active");
+            panic!("{}", Error::StreamNotActive.message());
         }
 
         terminalize_stream(&mut info, env.ledger().timestamp());
@@ -230,7 +233,7 @@ impl StreamPayContract {
     /// workloads into batches of `MAX_BATCH_SETTLE_SIZE` or fewer ids.
     pub fn batch_settle(env: Env, stream_ids: Vec<u32>) -> Vec<i128> {
         if stream_ids.len() > MAX_BATCH_SETTLE_SIZE {
-            panic!("batch too large");
+            panic!("{}", Error::BatchTooLarge.message());
         }
 
         let mut settled_amounts = Vec::new(&env);
@@ -273,7 +276,7 @@ impl StreamPayContract {
         info.payer.require_auth();
 
         if !info.is_active {
-            panic!("cannot cancel inactive stream");
+            panic!("{}", Error::CannotCancelInactiveStream.message());
         }
 
         terminalize_stream(&mut info, env.ledger().timestamp());
@@ -292,10 +295,10 @@ impl StreamPayContract {
         info.payer.require_auth();
 
         if !info.is_active {
-            panic!("cannot pause inactive stream");
+            panic!("{}", Error::CannotPauseInactiveStream.message());
         }
         if info.paused_at > 0 {
-            panic!("stream already paused");
+            panic!("{}", Error::StreamAlreadyPaused.message());
         }
 
         let now = env.ledger().timestamp();
@@ -325,10 +328,10 @@ impl StreamPayContract {
         info.payer.require_auth();
 
         if !info.is_active {
-            panic!("cannot resume inactive stream");
+            panic!("{}", Error::CannotResumeInactiveStream.message());
         }
         if info.paused_at == 0 {
-            panic!("stream is not paused");
+            panic!("{}", Error::StreamIsNotPaused.message());
         }
 
         let now = env.ledger().timestamp();
@@ -369,10 +372,13 @@ impl StreamPayContract {
         let info = get_stream(&env, stream_id);
         info.payer.require_auth();
         if info.is_active {
-            panic!("cannot archive active stream");
+            panic!("{}", Error::CannotArchiveActiveStream.message());
         }
         if info.balance != 0 {
-            panic!("cannot archive stream with unsettled balance");
+            panic!(
+                "{}",
+                Error::CannotArchiveStreamWithUnsettledBalance.message()
+            );
         }
         let key = stream_key(&env, stream_id);
         env.storage().persistent().remove(&key);
@@ -415,7 +421,7 @@ fn get_stream(env: &Env, stream_id: u32) -> StreamInfo {
     env.storage()
         .persistent()
         .get(&key)
-        .unwrap_or_else(|| panic!("stream not found"))
+        .unwrap_or_else(|| panic!("{}", Error::StreamNotFound.message()))
 }
 
 fn set_stream(env: &Env, stream_id: u32, info: &StreamInfo) {

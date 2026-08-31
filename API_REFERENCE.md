@@ -319,22 +319,44 @@ assert_eq!(v, 2_000);  // v0.2.0
 
 ---
 
-## Error Guide
+## Error Guide & Stabilized Error Codes
 
-| Error Message | Function | Cause | Fix |
-|---------------|----------|-------|-----|
-| `"rate and balance must be positive"` | create_stream | Non-positive rate/balance | Use positive values |
-| `"stream already active"` | start_stream | Stream already started | Call start_stream once |
-| `"end_time must be in the future"` | start_stream | end_time ≤ now | Use future timestamp |
-| `"cannot cancel inactive stream"` | cancel_stream | Stream not active | Start stream first |
-| `"cannot pause inactive stream"` | pause_stream | Stream not active | Start stream first |
-| `"stream already paused"` | pause_stream | Already paused | Resume first |
-| `"cannot resume inactive stream"` | resume_stream | Stream not active | Start stream first |
-| `"stream is not paused"` | resume_stream | Not paused | Pause first |
-| `"stream not active"` | stop_stream | Stream already stopped | Call once |
-| `"cannot archive active stream"` | archive_stream | Stream still running | Stop first |
-| `"cannot archive stream with unsettled balance"` | archive_stream | Balance not zero | Settle first |
-| `"stream not found"` | Any | Stream ID invalid | Check ID |
+StreamPay provides stabilized, versioned error codes with numeric identifiers and category ranges:
+- **100–199**: Validation & Input
+- **200–299**: Lifecycle & State
+- **300–399**: Storage & Archiving
+- **400–499**: Authorization & Access Control
+- **500–599**: Settlement & Arithmetic
+- **900–999**: System & Fallback
+
+| Code | Variant | Category | Error Message | Function | Recoverability | Fix |
+|------|---------|----------|---------------|----------|----------------|-----|
+| `101` | `RateAndBalanceMustBePositive` | Validation | `"rate and balance must be positive"` | create_stream | Retryable | Use positive values (`> 0`) |
+| `102` | `EndTimeMustBeInFuture` | Validation | `"end_time must be in the future"` | start_stream | Retryable | Use future timestamp (`end_time > now`) |
+| `103` | `BatchTooLarge` | Validation | `"batch too large"` | batch_settle | Retryable | Limit batch size to ≤ 25 stream IDs |
+| `104` | `InvalidAmount` | Validation | `"invalid amount"` | Any | Retryable | Pass valid positive amount |
+| `105` | `ZeroAmount` | Validation | `"amount cannot be zero"` | Any | Retryable | Specify non-zero quantity |
+| `106` | `InvalidTimeRange` | Validation | `"invalid time range"` | create_stream | Retryable | Ensure schedule is valid |
+| `201` | `StreamAlreadyActive` | Lifecycle | `"stream already active"` | start_stream | Terminal | Call start_stream once per stream |
+| `202` | `StreamNotActive` | Lifecycle | `"stream not active"` | stop_stream | Terminal | Stream is stopped or unstarted |
+| `203` | `CannotCancelInactiveStream` | Lifecycle | `"cannot cancel inactive stream"` | cancel_stream | Terminal | Stream must be active to cancel |
+| `204` | `CannotPauseInactiveStream` | Lifecycle | `"cannot pause inactive stream"` | pause_stream | Retryable | Start stream before pausing |
+| `205` | `StreamAlreadyPaused` | Lifecycle | `"stream already paused"` | pause_stream | Retryable | Resume stream first |
+| `206` | `CannotResumeInactiveStream` | Lifecycle | `"cannot resume inactive stream"` | resume_stream | Retryable | Start stream first |
+| `207` | `StreamIsNotPaused` | Lifecycle | `"stream is not paused"` | resume_stream | Retryable | Pause stream before resuming |
+| `208` | `StreamAlreadyTerminated` | Lifecycle | `"stream already terminated"` | Any | Terminal | Stream reached end time / stopped |
+| `301` | `StreamNotFound` | Storage | `"stream not found"` | Any | Retryable | Verify stream ID in persistent storage |
+| `302` | `CannotArchiveActiveStream` | Storage | `"cannot archive active stream"` | archive_stream | Terminal | Stop and settle stream before archiving |
+| `303` | `CannotArchiveStreamWithUnsettledBalance` | Storage | `"cannot archive stream with unsettled balance"` | archive_stream | Retryable | Settle balance to 0 before archiving |
+| `304` | `StorageKeyNotFound` | Storage | `"storage key not found"` | Storage | RequiresAdmin | Check storage key configuration |
+| `305` | `StorageQuotaExceeded` | Storage | `"storage quota exceeded"` | Storage | RequiresAdmin | Manage storage TTL and footprint |
+| `401` | `Unauthorized` | Authorization | `"unauthorized caller"` | Any | Terminal | Provide valid cryptographic signature |
+| `402` | `NotPayer` | Authorization | `"caller is not payer"` | Any | Terminal | Only stream payer may invoke operation |
+| `403` | `NotRecipient` | Authorization | `"caller is not recipient"` | Any | Terminal | Caller must match recipient address |
+| `501` | `ArithmeticOverflow` | Settlement | `"arithmetic overflow"` | Settlement | Terminal | Input exceeds numeric ceiling |
+| `502` | `InsufficientBalance` | Settlement | `"insufficient balance"` | Settlement | Terminal | Increase deposited balance |
+| `503` | `ZeroSettlement` | Settlement | `"zero settlement"` | Settlement | Terminal | Elapsed duration yielded zero value |
+| `999` | `UnknownError` | System | `"unknown error"` | System | Terminal | Safe fallback for unrecognized codes |
 
 ---
 
