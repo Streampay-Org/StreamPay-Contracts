@@ -323,13 +323,14 @@ Parties should ensure all disputes are resolved before archiving.
 
 ---
 
-## 9. Open Questions
+## 9. On-Chain Resolution & Invariants (Implemented in Issue #155)
 
-- [ ] Should StreamPay implement an on-chain dispute entry point (e.g., `raise_dispute(stream_id, evidence_hash)`) or keep dispute resolution fully off-chain?
-- [ ] What is the minimum indexer retention period for event history? (Regulatory requirements may mandate multi-year retention.)
-- [ ] Should the indexer expose a public API, or is it a private backend service per deployment?
-- [ ] When event emission is added (section 5), should events include the full `StreamInfo` struct or only the delta?
-- [ ] How should disputes interact with `archive_stream`? Should archival be blocked while a dispute flag is active?
+StreamPay implements on-chain dispute settlement via `resolve_dispute`:
+- **Unique Resolution Identity**: Each resolution requires a 32-byte unique `resolution_id` (e.g., hash of dispute ruling/evidence/signatures) that is permanently recorded as consumed.
+- **Replay Prevention**: Re-submitting an already-consumed `resolution_id` immediately reverts (`"resolution already consumed"`).
+- **Conflict Rejection & Value Conservation**: Payout amounts (`recipient_amount + payer_amount`) must non-negatively equal the available stream balance exactly.
+- **Terminal State**: Successful resolution terminates the stream (`is_active = false`, `balance = 0`), preventing concurrent/conflicting double-settlement.
+- **Event Emission**: Emits `DisputeResolvedEvent` with topic `("dispute_resolved", stream_id)`.
 
 ---
 

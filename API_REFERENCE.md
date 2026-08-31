@@ -298,6 +298,66 @@ assert_eq!(v, 2_000);  // v0.2.0
 
 ---
 
+## Dispute Resolution Operations (Issue #155)
+
+### resolve_dispute
+Resolve a dispute on a payment stream with replay prevention and value conservation.
+
+```rust
+pub fn resolve_dispute(
+    env: Env,
+    stream_id: u32,
+    resolution_id: BytesN<32>,
+    arbitrator: Address,
+    recipient_amount: i128,
+    payer_amount: i128,
+)
+```
+
+**Requires**: Arbitrator authentication (`arbitrator.require_auth()`)  
+**Returns**: Nothing  
+**Errors**:
+- `"resolution already consumed"` - If `resolution_id` has already been applied
+- `"resolution amounts must be non-negative"` - If recipient or payer amount < 0
+- `"resolution amounts must equal stream balance"` - If sum of payouts != available stream balance
+- `"stream not found"` - If stream does not exist
+
+**Behavior**:
+- Atomically consumes `resolution_id` to prevent replay attacks
+- Distributes available stream balance (`recipient_amount` + `payer_amount` == `balance`)
+- Deactivates the stream (`is_active = false`, `balance = 0`, `paused_at = 0`)
+- Emits `DisputeResolvedEvent` (`["dispute_resolved", stream_id]`)
+
+**Example**:
+```rust
+let resolution_id = BytesN::from_array(&env, &[42u8; 32]);
+client.resolve_dispute(&stream_id, &resolution_id, &arbitrator, &600, &400);
+```
+
+---
+
+### is_resolution_consumed
+Check if a dispute resolution identity has been consumed.
+
+```rust
+pub fn is_resolution_consumed(env: Env, resolution_id: BytesN<32>) -> bool
+```
+
+**Returns**: `true` if consumed, `false` otherwise
+
+---
+
+### get_resolution_info
+Retrieve recorded details of an applied dispute resolution.
+
+```rust
+pub fn get_resolution_info(env: Env, resolution_id: BytesN<32>) -> DisputeResolution
+```
+
+**Returns**: `DisputeResolution` struct with fields `stream_id`, `arbitrator`, `recipient_amount`, `payer_amount`, `resolved_at`
+
+---
+
 ## State Transitions
 
 ### Valid Transitions
