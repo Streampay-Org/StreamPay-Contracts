@@ -64,22 +64,36 @@
 //! 3. `new_balance >= 0` — `balance.saturating_sub(amount)` where `amount <=
 //!    balance` always yields a non-negative result.
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, Address, BytesN, Env, Symbol, Vec,
+};
+
+pub mod factory;
 
 /// Contract version: major * 1_000_000 + minor * 1_000 + patch.
 /// Current: 0.2.0 → 2_000
-const VERSION: u32 = 2_000;
+pub const VERSION: u32 = 2_000;
 
 /// TTL threshold: extend when remaining TTL drops below ~1 day (17_280 ledgers at ~5s each).
-const STREAM_TTL_THRESHOLD: u32 = 17_280;
+pub const STREAM_TTL_THRESHOLD: u32 = 17_280;
 /// TTL extend-to: refresh to ~30 days (518_400 ledgers).
-const STREAM_TTL_EXTEND: u32 = 518_400;
+pub const STREAM_TTL_EXTEND: u32 = 518_400;
 /// Instance storage TTL threshold (~1 day).
-const INSTANCE_TTL_THRESHOLD: u32 = 17_280;
+pub const INSTANCE_TTL_THRESHOLD: u32 = 17_280;
 /// Instance storage TTL extend-to (~30 days).
-const INSTANCE_TTL_EXTEND: u32 = 518_400;
+pub const INSTANCE_TTL_EXTEND: u32 = 518_400;
 /// Hard cap for batch settlement to keep Soroban resource usage predictable.
-const MAX_BATCH_SETTLE_SIZE: u32 = 25;
+pub const MAX_BATCH_SETTLE_SIZE: u32 = 25;
+
+/// Roles for role-based access control (RBAC).
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Role {
+    Admin = 0,
+    UpgradeAdmin = 1,
+    FactoryOperator = 2,
+    EmergencyAdmin = 3,
+}
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -107,6 +121,93 @@ pub struct StreamCreatedEvent {
     pub recipient: Address,
     pub rate_per_second: i128,
     pub initial_balance: i128,
+}
+
+/// Event data emitted when admin is initialized.
+///
+/// Topics: `["admin_initialized"]`
+/// Data:   `AdminInitializedEvent { admin }`
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminInitializedEvent {
+    pub admin: Address,
+}
+
+/// Event data emitted when admin is transferred.
+///
+/// Topics: `["admin_transferred", old_admin]`
+/// Data:   `AdminTransferredEvent { old_admin, new_admin }`
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferredEvent {
+    pub old_admin: Address,
+    pub new_admin: Address,
+}
+
+/// Event data emitted when a role is granted.
+///
+/// Topics: `["role_granted", account]`
+/// Data:   `RoleGrantedEvent { role, account, granter }`
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoleGrantedEvent {
+    pub role: Role,
+    pub account: Address,
+    pub granter: Address,
+}
+
+/// Event data emitted when a role is revoked.
+///
+/// Topics: `["role_revoked", account]`
+/// Data:   `RoleRevokedEvent { role, account, revoker }`
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoleRevokedEvent {
+    pub role: Role,
+    pub account: Address,
+    pub revoker: Address,
+}
+
+/// Event data emitted when a contract is upgraded.
+///
+/// Topics: `["contract_upgraded", caller]`
+/// Data:   `ContractUpgradedEvent { old_version, new_version, new_wasm_hash }`
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractUpgradedEvent {
+    pub old_version: u32,
+    pub new_version: u32,
+    pub new_wasm_hash: BytesN<32>,
+}
+
+/// Event data emitted when factory child WASM template / version is updated.
+///
+/// Topics: `["wasm_template_updated", updater]`
+/// Data:   `WasmTemplateUpdatedEvent { old_wasm_hash, new_wasm_hash, old_version, new_version, updater }`
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WasmTemplateUpdatedEvent {
+    pub old_wasm_hash: BytesN<32>,
+    pub new_wasm_hash: BytesN<32>,
+    pub old_version: u32,
+    pub new_version: u32,
+    pub updater: Address,
+}
+
+/// Event data emitted when factory deploys a child stream contract.
+///
+/// Topics: `["stream_deployed", stream_id]`
+/// Data:   `StreamDeployedEvent { stream_id, contract_address, payer, recipient, rate_per_second, initial_balance, end_time }`
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamDeployedEvent {
+    pub stream_id: u32,
+    pub contract_address: Address,
+    pub payer: Address,
+    pub recipient: Address,
+    pub rate_per_second: i128,
+    pub initial_balance: i128,
+    pub end_time: u64,
 }
 
 #[contract]
@@ -353,14 +454,116 @@ impl StreamPayContract {
         extend_instance_ttl(&env);
     }
 
+    /// Initialize contract admin. Can only be called once.
+    /// Grants Admin, UpgradeAdmin, FactoryOperator, and EmergencyAdmin roles.
+    pub fn initialize(env: Env, admin: Address) {
+        if has_admin(&env) {
+            panic!("already initialized");
+        }
+        set_admin_storage(&env, &admin);
+        set_role_storage(&env, Role::Admin, &admin, true);
+        set_role_storage(&env, Role::UpgradeAdmin, &admin, true);
+        set_role_storage(&env, Role::FactoryOperator, &admin, true);
+        set_role_storage(&env, Role::EmergencyAdmin, &admin, true);
+        extend_instance_ttl(&env);
+        emit_admin_initialized(&env, &admin);
+    }
+
+    /// Get current contract admin (if initialized).
+    pub fn get_admin(env: Env) -> Option<Address> {
+        get_admin_storage(&env)
+    }
+
+    /// Transfer contract admin to a new address.
+    /// Caller must be the current admin.
+    pub fn set_admin(env: Env, new_admin: Address) {
+        let current_admin = require_admin(&env);
+        if current_admin == new_admin {
+            panic!("new admin must be different");
+        }
+        set_admin_storage(&env, &new_admin);
+        set_role_storage(&env, Role::Admin, &new_admin, true);
+        set_role_storage(&env, Role::UpgradeAdmin, &new_admin, true);
+        set_role_storage(&env, Role::FactoryOperator, &new_admin, true);
+        set_role_storage(&env, Role::EmergencyAdmin, &new_admin, true);
+        set_role_storage(&env, Role::Admin, &current_admin, false);
+        extend_instance_ttl(&env);
+        emit_admin_transferred(&env, &current_admin, &new_admin);
+    }
+
+    /// Grant a role to an account.
+    /// Caller must be the current admin.
+    pub fn grant_role(env: Env, role: Role, account: Address) {
+        let granter = require_admin(&env);
+        set_role_storage(&env, role, &account, true);
+        extend_instance_ttl(&env);
+        emit_role_granted(&env, role, &account, &granter);
+    }
+
+    /// Revoke a role from an account.
+    /// Caller must be the current admin.
+    pub fn revoke_role(env: Env, role: Role, account: Address) {
+        let revoker = require_admin(&env);
+        set_role_storage(&env, role, &account, false);
+        extend_instance_ttl(&env);
+        emit_role_revoked(&env, role, &account, &revoker);
+    }
+
+    /// Check if an account has a specific role.
+    /// Admin account implicitly has all roles.
+    pub fn has_role(env: Env, role: Role, account: Address) -> bool {
+        if let Some(admin) = get_admin_storage(&env) {
+            if admin == account {
+                return true;
+            }
+        }
+        get_role_storage(&env, role, &account)
+    }
+
+    /// Upgrade contract code to a new WASM hash with explicit version bump.
+    /// Caller must be admin.
+    /// Requires `new_version > current_version` (strictly increasing).
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>, new_version: u32) {
+        let admin = require_admin(&env);
+        let current_version = get_current_version(&env);
+        if new_version <= current_version {
+            panic!("new version must be strictly greater than current version");
+        }
+        set_current_version(&env, new_version);
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+        extend_instance_ttl(&env);
+        emit_contract_upgraded(&env, current_version, new_version, &new_wasm_hash, &admin);
+    }
+
+    /// Upgrade contract code as an authorized operator with UpgradeAdmin role.
+    pub fn upgrade_as_operator(
+        env: Env,
+        operator: Address,
+        new_wasm_hash: BytesN<32>,
+        new_version: u32,
+    ) {
+        operator.require_auth();
+        if !Self::has_role(env.clone(), Role::UpgradeAdmin, operator.clone()) {
+            panic!("unauthorized");
+        }
+        let current_version = get_current_version(&env);
+        if new_version <= current_version {
+            panic!("new version must be strictly greater than current version");
+        }
+        set_current_version(&env, new_version);
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+        extend_instance_ttl(&env);
+        emit_contract_upgraded(&env, current_version, new_version, &new_wasm_hash, &operator);
+    }
+
     /// Get stream info (read-only).
     pub fn get_stream_info(env: Env, stream_id: u32) -> StreamInfo {
         get_stream(&env, stream_id)
     }
 
     /// Returns the contract version as a u32 (see VERSION encoding).
-    pub fn version(_env: Env) -> u32 {
-        VERSION
+    pub fn version(env: Env) -> u32 {
+        get_current_version(&env)
     }
 
     /// Archive (remove) a fully-settled, inactive stream. Payer-only.
@@ -404,6 +607,103 @@ fn emit_stream_created(
         initial_balance,
     };
     env.events().publish(topics, data);
+}
+
+fn emit_admin_initialized(env: &Env, admin: &Address) {
+    let topics = (Symbol::new(env, "admin_initialized"), Symbol::new(env, "admin"));
+    let data = AdminInitializedEvent {
+        admin: admin.clone(),
+    };
+    env.events().publish(topics, data);
+}
+
+fn emit_admin_transferred(env: &Env, old_admin: &Address, new_admin: &Address) {
+    let topics = (Symbol::new(env, "admin_transferred"), Symbol::new(env, "admin"));
+    let data = AdminTransferredEvent {
+        old_admin: old_admin.clone(),
+        new_admin: new_admin.clone(),
+    };
+    env.events().publish(topics, data);
+}
+
+fn emit_role_granted(env: &Env, role: Role, account: &Address, granter: &Address) {
+    let topics = (Symbol::new(env, "role_granted"), role as u32);
+    let data = RoleGrantedEvent {
+        role,
+        account: account.clone(),
+        granter: granter.clone(),
+    };
+    env.events().publish(topics, data);
+}
+
+fn emit_role_revoked(env: &Env, role: Role, account: &Address, revoker: &Address) {
+    let topics = (Symbol::new(env, "role_revoked"), role as u32);
+    let data = RoleRevokedEvent {
+        role,
+        account: account.clone(),
+        revoker: revoker.clone(),
+    };
+    env.events().publish(topics, data);
+}
+
+fn emit_contract_upgraded(
+    env: &Env,
+    old_version: u32,
+    new_version: u32,
+    new_wasm_hash: &BytesN<32>,
+    _caller: &Address,
+) {
+    let topics = (Symbol::new(env, "contract_upgraded"), new_version);
+    let data = ContractUpgradedEvent {
+        old_version,
+        new_version,
+        new_wasm_hash: new_wasm_hash.clone(),
+    };
+    env.events().publish(topics, data);
+}
+
+fn get_admin_storage(env: &Env) -> Option<Address> {
+    let key = Symbol::new(env, "admin");
+    env.storage().instance().get(&key)
+}
+
+fn set_admin_storage(env: &Env, admin: &Address) {
+    let key = Symbol::new(env, "admin");
+    env.storage().instance().set(&key, admin);
+}
+
+fn has_admin(env: &Env) -> bool {
+    get_admin_storage(env).is_some()
+}
+
+fn require_admin(env: &Env) -> Address {
+    let admin = get_admin_storage(env).unwrap_or_else(|| panic!("admin not initialized"));
+    admin.require_auth();
+    admin
+}
+
+fn get_role_storage(env: &Env, role: Role, account: &Address) -> bool {
+    let key = (Symbol::new(env, "role"), role, account.clone());
+    env.storage().instance().get(&key).unwrap_or(false)
+}
+
+fn set_role_storage(env: &Env, role: Role, account: &Address, active: bool) {
+    let key = (Symbol::new(env, "role"), role, account.clone());
+    if active {
+        env.storage().instance().set(&key, &true);
+    } else {
+        env.storage().instance().remove(&key);
+    }
+}
+
+fn get_current_version(env: &Env) -> u32 {
+    let key = Symbol::new(env, "version");
+    env.storage().instance().get(&key).unwrap_or(VERSION)
+}
+
+fn set_current_version(env: &Env, ver: u32) {
+    let key = Symbol::new(env, "version");
+    env.storage().instance().set(&key, &ver);
 }
 
 fn stream_key(env: &Env, stream_id: u32) -> (Symbol, u32) {
