@@ -64,7 +64,7 @@
 //! 3. `new_balance >= 0` — `balance.saturating_sub(amount)` where `amount <=
 //!    balance` always yields a non-negative result.
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Symbol, Vec};
 
 /// Contract version: major * 1_000_000 + minor * 1_000 + patch.
 /// Current: 0.2.0 → 2_000
@@ -82,7 +82,7 @@ const INSTANCE_TTL_EXTEND: u32 = 518_400;
 const MAX_BATCH_SETTLE_SIZE: u32 = 25;
 
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct StreamInfo {
     pub payer: Address,
     pub recipient: Address,
@@ -94,6 +94,17 @@ pub struct StreamInfo {
     pub paused_at: u64, // 0 if not paused; timestamp of pause if paused
 }
 
+/// Recorded outcome of an authorized dispute resolution.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisputeResolution {
+    pub stream_id: u32,
+    pub arbitrator: Address,
+    pub recipient_amount: i128,
+    pub payer_amount: i128,
+    pub resolved_at: u64,
+}
+
 /// Event data emitted when a new stream is created.
 ///
 /// Topics: `["stream_created", stream_id]`
@@ -101,12 +112,26 @@ pub struct StreamInfo {
 ///
 /// Indexers can filter on topic[0] == "stream_created" and topic[1] == stream_id.
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct StreamCreatedEvent {
     pub payer: Address,
     pub recipient: Address,
     pub rate_per_second: i128,
     pub initial_balance: i128,
+}
+
+/// Event data emitted when a dispute is resolved.
+///
+/// Topics: `["dispute_resolved", stream_id, resolution_id]`
+/// Data:   `DisputeResolvedEvent { stream_id, resolution_id, arbitrator, recipient_amount, payer_amount }`
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct DisputeResolvedEvent {
+    pub stream_id: u32,
+    pub resolution_id: BytesN<32>,
+    pub arbitrator: Address,
+    pub recipient_amount: i128,
+    pub payer_amount: i128,
 }
 
 #[contract]
@@ -363,6 +388,87 @@ impl StreamPayContract {
         VERSION
     }
 
+    /// Resolve a dispute on a payment stream (arbitrator-authorized).
+    ///
+    /// Consumes a unique resolution identity to prevent replay attacks.
+    /// Atomically distributes stream balance according to the resolution ruling,
+    /// deactivates the stream, and records the resolution state.
+    ///
+    /// # Replay and Conflict Protection
+    /// - `resolution_id` is recorded as consumed; re-submitting the same resolution_id will panic.
+    /// - `recipient_amount + payer_amount` must exactly equal stream's available balance.
+    /// - Stream is terminalized so subsequent resolutions or accrual settlements cannot double-spend.
+    pub fn resolve_dispute(
+        env: Env,
+        stream_id: u32,
+        resolution_id: BytesN<32>,
+        arbitrator: Address,
+        recipient_amount: i128,
+        payer_amount: i128,
+    ) {
+        arbitrator.require_auth();
+
+        if is_resolution_consumed_storage(&env, &resolution_id) {
+            panic!("resolution already consumed");
+        }
+
+        if recipient_amount < 0 || payer_amount < 0 {
+            panic!("resolution amounts must be non-negative");
+        }
+
+        let mut info = get_stream(&env, stream_id);
+
+        let total_payout = recipient_amount
+            .checked_add(payer_amount)
+            .unwrap_or_else(|| panic!("overflow in resolution amounts"));
+
+        if total_payout != info.balance {
+            panic!("resolution amounts must equal stream balance");
+        }
+
+        let now = env.ledger().timestamp();
+        let res_info = DisputeResolution {
+            stream_id,
+            arbitrator: arbitrator.clone(),
+            recipient_amount,
+            payer_amount,
+            resolved_at: now,
+        };
+
+        mark_resolution_consumed(&env, &resolution_id, &res_info);
+
+        info.balance = 0;
+        info.is_active = false;
+        info.paused_at = 0;
+        set_stream(&env, stream_id, &info);
+
+        extend_stream_ttl(&env, stream_id);
+        extend_instance_ttl(&env);
+
+        emit_dispute_resolved(
+            &env,
+            stream_id,
+            &resolution_id,
+            &arbitrator,
+            recipient_amount,
+            payer_amount,
+        );
+    }
+
+    /// Check if a dispute resolution ID has already been consumed.
+    pub fn is_resolution_consumed(env: Env, resolution_id: BytesN<32>) -> bool {
+        is_resolution_consumed_storage(&env, &resolution_id)
+    }
+
+    /// Get dispute resolution info for a consumed resolution ID.
+    pub fn get_resolution_info(env: Env, resolution_id: BytesN<32>) -> DisputeResolution {
+        let key = resolution_info_key(&env, &resolution_id);
+        env.storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| panic!("resolution not found"))
+    }
+
     /// Archive (remove) a fully-settled, inactive stream. Payer-only.
     /// Stream must be inactive and have zero balance to protect recipient entitlements.
     pub fn archive_stream(env: Env, stream_id: u32) {
@@ -533,6 +639,63 @@ fn extend_instance_ttl(env: &Env) {
     env.storage()
         .instance()
         .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND);
+}
+
+/// Emit a `dispute_resolved` contract event.
+///
+/// Topics:
+///   - `"dispute_resolved"` — event discriminator
+///   - `stream_id`          — stream identifier
+///   - `resolution_id`      — 32-byte unique resolution hash/nonce
+///
+/// Data payload: [`DisputeResolvedEvent`]
+fn emit_dispute_resolved(
+    env: &Env,
+    stream_id: u32,
+    resolution_id: &BytesN<32>,
+    arbitrator: &Address,
+    recipient_amount: i128,
+    payer_amount: i128,
+) {
+    let topics = (Symbol::new(env, "dispute_resolved"), stream_id);
+    let data = DisputeResolvedEvent {
+        stream_id,
+        resolution_id: resolution_id.clone(),
+        arbitrator: arbitrator.clone(),
+        recipient_amount,
+        payer_amount,
+    };
+    env.events().publish(topics, data);
+}
+
+fn resolution_key(env: &Env, resolution_id: &BytesN<32>) -> (Symbol, BytesN<32>) {
+    (Symbol::new(env, "res_consumed"), resolution_id.clone())
+}
+
+fn resolution_info_key(env: &Env, resolution_id: &BytesN<32>) -> (Symbol, BytesN<32>) {
+    (Symbol::new(env, "res_info"), resolution_id.clone())
+}
+
+fn is_resolution_consumed_storage(env: &Env, resolution_id: &BytesN<32>) -> bool {
+    let key = resolution_key(env, resolution_id);
+    env.storage().persistent().get(&key).unwrap_or(false)
+}
+
+fn mark_resolution_consumed(
+    env: &Env,
+    resolution_id: &BytesN<32>,
+    resolution_info: &DisputeResolution,
+) {
+    let key = resolution_key(env, resolution_id);
+    env.storage().persistent().set(&key, &true);
+    let info_key = resolution_info_key(env, resolution_id);
+    env.storage().persistent().set(&info_key, resolution_info);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, STREAM_TTL_THRESHOLD, STREAM_TTL_EXTEND);
+    env.storage()
+        .persistent()
+        .extend_ttl(&info_key, STREAM_TTL_THRESHOLD, STREAM_TTL_EXTEND);
 }
 
 #[cfg(test)]
@@ -1188,6 +1351,192 @@ mod test {
         );
         let info = client.get_stream_info(&stream_id);
         assert_eq!(info.balance, 0);
+    }
+
+    #[test]
+    fn test_resolve_dispute_success_and_replay_rejection() {
+        use soroban_sdk::testutils::Events as _;
+
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128, &0_u64);
+        client.start_stream(&stream_id);
+
+        let resolution_id = BytesN::from_array(&env, &[7u8; 32]);
+        assert!(!client.is_resolution_consumed(&resolution_id));
+
+        // Arbitrator awards 6,000 to recipient and 4,000 to payer
+        client.resolve_dispute(
+            &stream_id,
+            &resolution_id,
+            &arbitrator,
+            &6_000_i128,
+            &4_000_i128,
+        );
+
+        // Verify dispute_resolved event was emitted by resolve_dispute
+        let events = env.events().all();
+        assert_eq!(events.len(), 1);
+        let (_contract, topics, data) = events.get(0).unwrap();
+        let topic0: Symbol = soroban_sdk::FromVal::from_val(&env, &topics.get(0).unwrap());
+        let topic1: u32 = soroban_sdk::FromVal::from_val(&env, &topics.get(1).unwrap());
+        assert_eq!(topic0, Symbol::new(&env, "dispute_resolved"));
+        assert_eq!(topic1, stream_id);
+
+        let event_data: DisputeResolvedEvent = soroban_sdk::FromVal::from_val(&env, &data);
+        assert_eq!(event_data.stream_id, stream_id);
+        assert_eq!(event_data.resolution_id, resolution_id);
+        assert_eq!(event_data.arbitrator, arbitrator);
+        assert_eq!(event_data.recipient_amount, 6_000);
+        assert_eq!(event_data.payer_amount, 4_000);
+
+        // Verify resolution is marked as consumed
+        assert!(client.is_resolution_consumed(&resolution_id));
+
+        // Verify recorded resolution info
+        let res_info = client.get_resolution_info(&resolution_id);
+        assert_eq!(res_info.stream_id, stream_id);
+        assert_eq!(res_info.arbitrator, arbitrator);
+        assert_eq!(res_info.recipient_amount, 6_000);
+        assert_eq!(res_info.payer_amount, 4_000);
+
+        // Verify stream is terminalized and balance drained
+        let info = client.get_stream_info(&stream_id);
+        assert_eq!(info.balance, 0);
+        assert!(!info.is_active);
+
+        // Replay attempt with same resolution_id MUST panic
+        let replay_result = catch_unwind(AssertUnwindSafe(|| {
+            client.resolve_dispute(
+                &stream_id,
+                &resolution_id,
+                &arbitrator,
+                &6_000_i128,
+                &4_000_i128,
+            );
+        }));
+        assert!(
+            replay_result.is_err(),
+            "Replay of consumed resolution must panic"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "resolution amounts must equal stream balance")]
+    fn test_resolve_dispute_conservation_mismatch_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128, &0_u64);
+
+        let resolution_id = BytesN::from_array(&env, &[1u8; 32]);
+        // 5_000 + 4_000 = 9_000 != 10_000 -> mismatch
+        client.resolve_dispute(
+            &stream_id,
+            &resolution_id,
+            &arbitrator,
+            &5_000_i128,
+            &4_000_i128,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "resolution amounts must be non-negative")]
+    fn test_resolve_dispute_negative_amounts_fail() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128, &0_u64);
+
+        let resolution_id = BytesN::from_array(&env, &[2u8; 32]);
+        client.resolve_dispute(
+            &stream_id,
+            &resolution_id,
+            &arbitrator,
+            &-100_i128,
+            &10_100_i128,
+        );
+    }
+
+    #[test]
+    fn test_concurrent_dispute_resolutions_cannot_both_settle() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &100_i128, &10_000_i128, &0_u64);
+        client.start_stream(&stream_id);
+
+        let res_id_1 = BytesN::from_array(&env, &[3u8; 32]);
+        let res_id_2 = BytesN::from_array(&env, &[4u8; 32]);
+
+        // First resolution succeeds
+        client.resolve_dispute(&stream_id, &res_id_1, &arbitrator, &7_000_i128, &3_000_i128);
+        assert!(client.is_resolution_consumed(&res_id_1));
+
+        // Conflicting resolution with different ID targeting the same stream fails
+        let conflict_result = catch_unwind(AssertUnwindSafe(|| {
+            client.resolve_dispute(&stream_id, &res_id_2, &arbitrator, &5_000_i128, &5_000_i128);
+        }));
+        assert!(
+            conflict_result.is_err(),
+            "Concurrent or conflicting settlement must be rejected"
+        );
+        assert!(!client.is_resolution_consumed(&res_id_2));
+    }
+
+    #[test]
+    fn test_resolve_dispute_on_paused_stream() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(StreamPayContract, ());
+        let client = StreamPayContractClient::new(&env, &contract_id);
+
+        let payer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let arbitrator = Address::generate(&env);
+        let stream_id = client.create_stream(&payer, &recipient, &10_i128, &1_000_i128, &0_u64);
+        client.start_stream(&stream_id);
+
+        advance_ledger_time(&env, 10);
+        client.pause_stream(&stream_id);
+        let paused_info = client.get_stream_info(&stream_id);
+        assert_eq!(paused_info.balance, 900);
+
+        let resolution_id = BytesN::from_array(&env, &[5u8; 32]);
+        client.resolve_dispute(
+            &stream_id,
+            &resolution_id,
+            &arbitrator,
+            &500_i128,
+            &400_i128,
+        );
+
+        let info = client.get_stream_info(&stream_id);
+        assert_eq!(info.balance, 0);
+        assert!(!info.is_active);
+        assert_eq!(info.paused_at, 0);
+        assert!(client.is_resolution_consumed(&resolution_id));
     }
 }
 

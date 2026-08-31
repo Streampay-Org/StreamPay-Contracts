@@ -33,7 +33,7 @@
                   }
                 },
                 {
-                  "bool": false
+                  "u64": 0
                 }
               ]
             }
@@ -139,6 +139,14 @@
                     },
                     {
                       "key": {
+                        "symbol": "paused_at"
+                      },
+                      "val": {
+                        "u64": 0
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "payer"
                       },
                       "val": {
@@ -162,14 +170,6 @@
                       },
                       "val": {
                         "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                      }
-                    },
-                    {
-                      "key": {
-                        "symbol": "recipient_can_stop"
-                      },
-                      "val": {
-                        "bool": false
                       }
                     },
                     {
