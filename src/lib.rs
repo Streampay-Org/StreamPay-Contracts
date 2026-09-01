@@ -160,7 +160,7 @@ impl StreamPayContract {
     pub fn start_stream(env: Env, stream_id: u32) {
         let mut info = get_stream(&env, stream_id);
         info.payer.require_auth();
-        if info.is_active {
+        if info.is_active || info.start_time > 0 {
             panic!("stream already active");
         }
         let now = env.ledger().timestamp();
@@ -253,8 +253,7 @@ impl StreamPayContract {
         settled_amounts
     }
 
-    /// Returns the configured maximum number of stream ids allowed in one
-    /// `batch_settle` invocation.
+    /// Returns the configured maximum number of stream ids allowed in one `batch_settle` invocation.
     pub fn max_batch_settle_size(_env: Env) -> u32 {
         MAX_BATCH_SETTLE_SIZE
     }
@@ -505,8 +504,7 @@ fn settle_info_to_boundary(info: &mut StreamInfo, boundary: u64) -> i128 {
     amount
 }
 
-/// Settle through the same pause/end-aware boundary used by permissionless
-/// settlement, then make the stream terminal and clear stale pause state.
+/// Settle through the same pause/end-aware boundary used by permissionless settlement, then make the stream terminal and clear stale pause state.
 fn terminalize_stream(info: &mut StreamInfo, now: u64) {
     let terminal_boundary = end_bound(now, info.end_time);
     let boundary = accrual_bound(now, info.end_time, info.paused_at);
