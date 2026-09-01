@@ -33,7 +33,7 @@
                   }
                 },
                 {
-                  "bool": false
+                  "u64": 0
                 }
               ]
             }
@@ -73,9 +73,6 @@
               "args": [
                 {
                   "u32": 1
-                },
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 }
               ]
             }
